@@ -79,7 +79,8 @@ export async function post(
 ): Promise<boolean> {
   if (lines.length === 0) throw new Error(`posting ${ref} has no lines`);
   let net = 0n; // debits minus credits over the whole posting; must be zero
-  const delta = new Map<string, bigint>(); // change per account: its normal side adds, the other subtracts
+  // change per account: lines on its normal side add, the others subtract
+  const delta = new Map<string, bigint>();
   for (const l of lines) {
     if (l.amount <= 0n) throw new Error(`line amount must be positive, got ${l.amount}`);
     checkAsset(l.account, asset);
@@ -101,7 +102,9 @@ export async function post(
   for (const account of [...delta.keys()].sort()) {
     await ensureAccount(tx, account, asset);
     try {
-      await tx`update ledger_accounts set balance = balance + ${delta.get(account) ?? 0n} where name = ${account}`;
+      await tx`
+        update ledger_accounts set balance = balance + ${delta.get(account) ?? 0n}
+        where name = ${account}`;
     } catch (e) {
       const err = e as { code?: string; constraint_name?: string };
       if (err.code === '23514' && err.constraint_name === 'ledger_accounts_balance_check') {

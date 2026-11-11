@@ -188,10 +188,21 @@ describe('ledger', () => {
     expect(await balance(t.db, acct.user('u1', a))).toBe(40n);
   });
 
-  it('L5e lockAccount creates the account and holds a concurrent post back', async () => {
+  it('L5e lockAccount creates a missing account', async () => {
     const a = asset('l5e');
+    const user = acct.user('fresh', a);
+    await t.db.begin((tx) => lockAccount(tx, user, a));
+    const rows = await t.db`select balance, normal_side from ledger_accounts where name = ${user}`;
+    expect(rows).toEqual([{ balance: 0n, normal_side: 'credit' }]);
+    await expect(t.db.begin((tx) => lockAccount(tx, user, asset('l5e-other')))).rejects.toThrow(
+      /is not an/,
+    );
+  });
+
+  it('L5f lockAccount holds the row lock until its transaction ends', async () => {
+    const a = asset('l5f');
     const user = acct.user('u', a);
-    await t.db.begin((tx) => post(tx, 'l5e:fund', 'fund', a, fund('other', a, 10n)));
+    await t.db.begin((tx) => post(tx, 'l5f:fund', 'fund', a, fund('u', a, 10n))); // the row exists and is committed
     let locked!: () => void;
     const aReady = new Promise<void>((r) => (locked = r));
     let release!: () => void;
@@ -202,23 +213,34 @@ describe('ledger', () => {
       await gate;
     });
     await Promise.race([aReady, holder]);
-    const poster = t.db.begin((tx) => post(tx, 'l5e:fund2', 'fund', a, fund('u', a, 5n)));
+
+    let bPid: number | undefined;
     let postDone = false;
-    void poster.then(() => (postDone = true));
+    const poster = t.db.begin(async (tx) => {
+      const [p] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      bPid = p?.pid;
+      return post(tx, 'l5f:fund2', 'fund', a, fund('u', a, 5n));
+    });
+    const posterDone = poster.then(
+      (ok) => ((postDone = true), ok),
+      (e: unknown) => {
+        release(); // do not leave the holder open if the poster failed
+        throw e;
+      },
+    );
     for (let i = 0; ; i++) {
-      const waiting = await t.db`select 1 from pg_locks where not granted`;
-      if (waiting.length > 0) break;
+      if (bPid !== undefined) {
+        const waiting = await t.db`select 1 from pg_locks where not granted and pid = ${bPid}`;
+        if (waiting.length > 0) break;
+      }
       if (i > 200) throw new Error('the post never blocked behind lockAccount');
       await sleep(25);
     }
     expect(postDone).toBe(false);
     release();
     await holder;
-    expect(await poster).toBe(true);
-    expect(await balance(t.db, user)).toBe(5n);
-    await expect(t.db.begin((tx) => lockAccount(tx, user, asset('l5e-other')))).rejects.toThrow(
-      /is not an/,
-    );
+    expect(await posterDone).toBe(true);
+    expect(await balance(t.db, user)).toBe(15n);
   });
 
   it('L6 amounts above 2^64 are exact', async () => {

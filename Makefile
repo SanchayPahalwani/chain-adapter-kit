@@ -1,4 +1,4 @@
-.PHONY: up down test typecheck lint
+.PHONY: up down test typecheck lint migrate
 
 node_modules: package-lock.json
 	npm ci
@@ -17,3 +17,6 @@ typecheck: node_modules
 
 lint: node_modules
 	npm run lint
+
+migrate: node_modules
+	npx tsx scripts/migrate.ts

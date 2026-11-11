@@ -74,6 +74,7 @@ export interface InputStore {
 /**
  * Opaque values (`fee`, `reservation`, `UnsignedTx.body`) are JSON-safe: bigints are
  * decimal strings. The pipeline stores them as `jsonb` and hands them back unchanged.
+ * They must be JSON objects, never `null` (use `{}` for "nothing"): the columns are `jsonb not null`.
  */
 export interface ChainAdapter {
   readonly chain: string; // 'evm-anvil', 'bitcoin-regtest'

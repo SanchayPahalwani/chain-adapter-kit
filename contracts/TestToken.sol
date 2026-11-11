@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.30;
 
-// A test token for local devnets. Minting is open: anyone can mint any amount to anyone.
-// Never deploy it anywhere that matters.
+// A test token for local devnets. Minting and burning are open: anyone can mint any amount to
+// anyone, and burn anyone's tokens. Never deploy it anywhere that matters.
 contract TestToken {
     string public constant name = "Test Token";
     string public constant symbol = "TEST";
@@ -22,5 +22,10 @@ contract TestToken {
     function mint(address to, uint256 value) external {
         balanceOf[to] += value;
         emit Transfer(address(0), to, value);
+    }
+
+    function burn(address from, uint256 value) external {
+        balanceOf[from] -= value; // reverts on underflow
+        emit Transfer(from, address(0), value);
     }
 }

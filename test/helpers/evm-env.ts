@@ -1,8 +1,8 @@
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { createEvmAdapter } from '../../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../../src/adapters/evm/devnet.js';
 import type { Devnet } from '../../src/conformance/harness.js';
 import { config } from '../../src/config.js';
+import { LocalSigner } from '../../src/core/local-signer.js';
 import type { PipelineEnv } from '../pipeline-suite.js';
 
 const STUCK_BASE_FEE = 100n * 10n ** 9n; // 100 gwei
@@ -39,7 +39,8 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     devnet,
     assets: ['native', token],
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
-    freshAddress: () => Promise.resolve(privateKeyToAccount(generatePrivateKey()).address),
+    freshAddress: async () =>
+      adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
     async makeStuck() {
       stuck = true;
       // Takes effect at the next mined block. Quotes read the latest block's base fee, so they

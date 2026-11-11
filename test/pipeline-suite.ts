@@ -41,7 +41,8 @@ export interface PipelineEnv {
   clearStuck(): Promise<void>; // back to the normal fee level
 }
 
-const GAS = 10n ** 18n; // native the hot wallet holds for fees, booked as the platform's own
+// native the hot wallet holds for fees, booked as the platform's own
+const gasFloat = (env: PipelineEnv) => 100n * env.unit('native');
 const unlimited = 10n ** 40n;
 const policy: AssetPolicy = {
   perWithdrawalMax: unlimited,
@@ -71,7 +72,16 @@ export interface Pipeline {
   close(): Promise<void>;
 }
 
-export async function openPipeline(env: PipelineEnv): Promise<Pipeline> {
+export interface PipelineOptions {
+  // false: the ledger is funded as usual, but nothing (gas float or deposits) reaches the hot
+  // wallet on-chain, so it cannot pay until the test funds it with env.devnet.fund
+  fundOnChain?: boolean;
+}
+
+export async function openPipeline(
+  env: PipelineEnv,
+  { fundOnChain = true }: PipelineOptions = {},
+): Promise<Pipeline> {
   const t = await createTestDb();
   try {
     const signer = LocalSigner.random();
@@ -90,11 +100,12 @@ export async function openPipeline(env: PipelineEnv): Promise<Pipeline> {
     };
     const userId = `user-${randomUUID()}`;
     const n = ledgerAsset(env.chain, 'native');
-    await env.devnet.fund(hot.hotAddress, 'native', GAS);
+    const gas = gasFloat(env);
+    if (fundOnChain) await env.devnet.fund(hot.hotAddress, 'native', gas);
     await t.db.begin((tx) =>
       post(tx, `fund:${hot.hotAddress}`, 'fund', n, [
-        { account: acct.custody(n), side: 'debit', amount: GAS },
-        { account: acct.platform(n), side: 'credit', amount: GAS },
+        { account: acct.custody(n), side: 'debit', amount: gas },
+        { account: acct.platform(n), side: 'credit', amount: gas },
       ]),
     );
     let deposits = 0;
@@ -111,7 +122,7 @@ export async function openPipeline(env: PipelineEnv): Promise<Pipeline> {
             { account: acct.user(userId, a), side: 'credit', amount },
           ]),
         );
-        await env.devnet.fund(hot.hotAddress, asset, amount);
+        if (fundOnChain) await env.devnet.fund(hot.hotAddress, asset, amount);
       },
       async withdraw(asset, amount) {
         const to = await env.freshAddress();
@@ -160,6 +171,21 @@ export async function drive(
   }
 }
 
+/** Like drive, but never mines: nothing confirms unless the test mines. */
+async function driveWithoutMining(deps: WorkerDeps, until: () => Promise<boolean>) {
+  const deadline = Date.now() + 20_000;
+  while (!(await until())) {
+    if (Date.now() > deadline) throw new Error('drive timed out');
+    if (!(await runOnce(deps, 'driver'))) await sleep(deps.timings.pollMs);
+  }
+}
+
+// An `until` for drive that holds once `ms` have passed (a test duration, not a pipeline clock).
+const after = (ms: number) => {
+  const end = Date.now() + ms;
+  return () => Promise.resolve(Date.now() >= end);
+};
+
 const terminal = (db: Db, id: string) => async () => {
   const { state } = await getWithdrawal(db, id);
   return state === 'SETTLED' || state === 'FAILED';
@@ -178,11 +204,43 @@ async function feePaid(env: PipelineEnv, txid: string | null): Promise<bigint> {
   return status.feePaid;
 }
 
-const withAdapter = (deps: WorkerDeps, chain: string, adapter: ChainAdapter): WorkerDeps => {
-  const rt = deps.chains[chain];
-  if (!rt) throw new Error(`no runtime for ${chain}`);
-  return { ...deps, chains: { ...deps.chains, [chain]: { ...rt, adapter } } };
-};
+/**
+ * `adapter` with the named methods replaced and every other member read from `adapter` itself.
+ * A Proxy rather than `{ ...adapter }`: a spread copies only own enumerable properties, so it
+ * would lose the methods of an adapter written as a class.
+ */
+export function overrideAdapter(
+  adapter: ChainAdapter,
+  methods: Partial<ChainAdapter>,
+): ChainAdapter {
+  return new Proxy(adapter, {
+    get(target, key) {
+      if (Object.hasOwn(methods, key)) return methods[key as keyof ChainAdapter];
+      const value: unknown = Reflect.get(target, key);
+      // bound, so a class method still finds its own instance as `this`
+      return typeof value === 'function' ? (value as () => unknown).bind(target) : value;
+    },
+  });
+}
+
+/** `deps` whose adapter for `env.chain` has the named methods replaced. */
+function withMethods(
+  deps: WorkerDeps,
+  env: PipelineEnv,
+  methods: Partial<ChainAdapter>,
+): WorkerDeps {
+  const rt = deps.chains[env.chain];
+  if (!rt) throw new Error(`no runtime for ${env.chain}`);
+  const adapter = overrideAdapter(rt.adapter, methods);
+  return { ...deps, chains: { ...deps.chains, [env.chain]: { ...rt, adapter } } };
+}
+
+/** The kinds of a withdrawal's events in order; a state change reads `FROM>TO`. */
+export async function eventsOf(db: Db, id: string): Promise<string[]> {
+  const rows = await db<{ kind: string; data: { from?: string; to?: string } }[]>`
+    select kind, data from withdrawal_events where withdrawal_id = ${id} order by id`;
+  return rows.map((e) => (e.kind === 'state' ? `${e.data.from}>${e.data.to}` : e.kind));
+}
 
 /** Twelve native withdrawals, three concurrent workers and a miner, until all are terminal. */
 export async function twelveConcurrent(p: Pipeline, env: PipelineEnv): Promise<Withdrawal[]> {
@@ -198,6 +256,14 @@ export async function twelveConcurrent(p: Pipeline, env: PipelineEnv): Promise<W
   const stop = new AbortController();
   const stopMiner = startMiner(env.devnet, 50);
   const workers = ['w1', 'w2', 'w3'].map((id) => runWorker(p.deps, id, stop.signal));
+  // allSettled: a worker that rejects must not skip stopping the others and the miner
+  const stopAll = async () => {
+    stop.abort();
+    const results = await Promise.allSettled(workers);
+    await stopMiner();
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed) throw failed.reason;
+  };
   try {
     await waitFor(
       'twelve terminal withdrawals',
@@ -209,9 +275,7 @@ export async function twelveConcurrent(p: Pipeline, env: PipelineEnv): Promise<W
       25_000,
     );
   } finally {
-    stop.abort();
-    await Promise.all(workers);
-    await stopMiner();
+    await stopAll();
   }
   return Promise.all(ws.map((w) => getWithdrawal(p.db, w.id)));
 }
@@ -249,7 +313,9 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
       expect(await balance(p.db, acct.user(p.userId, n()))).toBe(4n * amount);
       expect(await balance(p.db, acct.inFlight(n()))).toBe(0n);
-      expect(await balance(p.db, acct.custody(n()))).toBe(GAS + 5n * amount - amount - fee);
+      expect(await balance(p.db, acct.custody(n()))).toBe(
+        gasFloat(env) + 5n * amount - amount - fee,
+      );
       expect(await balance(p.db, acct.custody(n()))).toBe(
         await env.adapter.getBalance(p.hot.hotAddress, native),
       );
@@ -259,9 +325,9 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(done.settledTxid).toBe(attempts[0]?.txid);
     });
 
-    it('P2 a token withdrawal of 10n**30n settles; the fee is booked in native', async () => {
+    it('P2 a token withdrawal of 10n**30n settles; the fee is booked in native', async (ctx) => {
       const token = env.assets[1];
-      if (!token) throw new Error('the env has no token asset');
+      if (!token) return ctx.skip('this chain has no token asset');
       const t = ledgerAsset(env.chain, token);
       const amount = 10n ** 30n;
       await p.credit(token, amount);
@@ -351,9 +417,13 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
 
       // Hold the row lock so both handlers reach their compare-and-swap and wait on it together.
       const lock = await lockRow(p.db, id);
-      const both = Promise.allSettled([handlers.RESERVED(p.deps, w), handlers.RESERVED(p.deps, w)]);
-      await lockWaiters(p.db, 2);
-      await lock.release();
+      let both;
+      try {
+        both = Promise.allSettled([handlers.RESERVED(p.deps, w), handlers.RESERVED(p.deps, w)]);
+        await lockWaiters(p.db, lock.pid, 2);
+      } finally {
+        await lock.release();
+      }
       const results = await both;
 
       expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
@@ -368,14 +438,12 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       await p.credit(native, amount);
       const w = await p.withdraw(native, amount);
       let failures = 1;
-      const flaky: ChainAdapter = {
-        ...env.adapter,
+      const deps = withMethods(p.deps, env, {
         broadcast: (tx: SignedTx) =>
           failures-- > 0
             ? Promise.reject(new Error('connect ECONNREFUSED (test)'))
             : env.adapter.broadcast(tx),
-      };
-      const deps = withAdapter(p.deps, env.chain, flaky);
+      });
       await runOnce(deps, 'one');
       await runOnce(deps, 'one');
       expect(await state(w.id)).toBe('SIGNED');
@@ -398,9 +466,15 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       const amount = env.unit(native);
       await p.credit(native, amount);
       const w = await p.withdraw(native, amount);
-      const claimed = await claim(p.deps, 'A'); // A never runs the handler or releases
+      // A claims with a long lease, so B is certain to find it held, and never runs the
+      // handler or releases. The lease is then moved into the past instead of waited out.
+      const long = { ...p.deps, timings: { ...p.deps.timings, leaseMs: 60_000 } };
+      const claimed = await claim(long, 'A');
       expect(claimed?.id).toBe(w.id);
       expect(await runOnce(p.deps, 'B')).toBe(false); // the lease still holds
+      await p.db`
+        update withdrawals set lease_expires_at = now() - interval '1 millisecond'
+         where id = ${w.id} and lease_owner = 'A'`;
 
       await drive(p.deps, env, terminal(p.db, w.id), 20_000, 'B');
       expect(await state(w.id)).toBe('SETTLED');
@@ -423,7 +497,7 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(await state(w.id)).toBe('SIGNED');
 
       const spy = vi.fn((tx: SignedTx) => env.adapter.broadcast(tx));
-      const deps = withAdapter(p.deps, env.chain, { ...env.adapter, broadcast: spy });
+      const deps = withMethods(p.deps, env, { broadcast: spy });
       await runOnce(deps, 'two');
       expect(await state(w.id)).toBe('BROADCAST');
       expect(spy).not.toHaveBeenCalled();
@@ -433,22 +507,180 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(await state(w.id)).toBe('SETTLED');
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
     });
+
+    // APPROVED to BROADCAST in three steps, with nothing mined: the only attempt is pending.
+    async function toBroadcast(deps: WorkerDeps, w: Withdrawal) {
+      for (let i = 0; i < 3; i++) await runOnce(deps, 'one');
+      expect(await state(w.id)).toBe('BROADCAST');
+      const [first] = await attemptsOf(p.db, w.id);
+      if (!first) throw new Error('no attempt');
+      expect(await env.adapter.getTxStatus(first.txid)).toEqual({ state: 'pending' });
+      return first;
+    }
+
+    it('F1 a dropped transaction is sent again and settles once', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const first = await toBroadcast(p.deps, w);
+      await env.devnet.dropFromMempool(first.txid);
+      await drive(p.deps, env, terminal(p.db, w.id));
+
+      expect(await state(w.id)).toBe('SETTLED');
+      const attempts = await attemptsOf(p.db, w.id);
+      expect(attempts.map((a) => a.txid)).toEqual([first.txid]);
+      expect(await eventsOf(p.db, w.id)).toEqual([
+        'APPROVED>RESERVED',
+        'RESERVED>SIGNED',
+        'SIGNED>BROADCAST',
+        'broadcast',
+        'rebroadcast',
+        'BROADCAST>SETTLED',
+      ]);
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it('F2 a reorg before finality: the withdrawal still settles once', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const first = await toBroadcast(p.deps, w);
+      await env.devnet.mine(1);
+      const seen = await env.adapter.getTxStatus(first.txid);
+      if (seen.state !== 'confirmed') throw new Error(`attempt is ${seen.state}`);
+      expect(seen.confirmations).toBeLessThan(env.adapter.finalityDepth);
+      await runOnce(p.deps, 'one'); // records the block
+      const [row] = await p.db<{ seen_block: string | null }[]>`
+        select seen_block from tx_attempts where withdrawal_id = ${w.id}`;
+      expect(row?.seen_block).toBe(seen.block.hash);
+
+      await env.devnet.reorg(1);
+      await drive(p.deps, env, terminal(p.db, w.id));
+
+      const done = await getWithdrawal(p.db, w.id);
+      expect(done.state).toBe('SETTLED');
+      expect(done.settledTxid).toBe(first.txid);
+      const events = await eventsOf(p.db, w.id);
+      expect(events.filter((k) => k === 'reorged_out' || k === 'reorg')).toHaveLength(1);
+      const settled = await env.adapter.getTxStatus(first.txid);
+      if (settled.state !== 'confirmed') throw new Error(`attempt is ${settled.state}`);
+      expect(settled.block.hash).not.toBe(seen.block.hash);
+      expect(await attemptsOf(p.db, w.id)).toHaveLength(1);
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it('F3 a stuck transaction is replaced and exactly one attempt confirms', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const first = await toBroadcast(p.deps, w);
+      const { reservation } = await getWithdrawal(p.db, w.id);
+      await env.makeStuck();
+      // mines after every step, so the first attempt's fee falls below the raised level at once
+      await drive(p.deps, env, terminal(p.db, w.id));
+
+      const done = await getWithdrawal(p.db, w.id);
+      expect(done.state).toBe('SETTLED');
+      expect(done.reservation).toEqual(reservation);
+      const attempts = await p.db<{ txid: string; fee: unknown }[]>`
+        select txid, fee from tx_attempts where withdrawal_id = ${w.id} order by attempt_no`;
+      expect(attempts).toHaveLength(2);
+      const [one, two] = attempts;
+      expect(one?.txid).toBe(first.txid);
+      expect(done.settledTxid).toBe(two?.txid);
+      expect(two?.fee).not.toEqual(one?.fee); // quoted again, at the raised level
+      expect((await env.adapter.getTxStatus(first.txid)).state).not.toBe('confirmed');
+      expect(await eventsOf(p.db, w.id)).toContain('replacement');
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it('F4 a reverted transfer ends FAILED with the hold released and the fee booked', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      // The chain reports every confirmed attempt as reverted. A real revert is an EVM test.
+      const deps = withMethods(p.deps, env, {
+        getTxStatus: async (txid) => {
+          const s = await env.adapter.getTxStatus(txid);
+          return s.state === 'confirmed' ? { ...s, succeeded: false } : s;
+        },
+      });
+      await drive(deps, env, terminal(p.db, w.id));
+
+      const done = await getWithdrawal(p.db, w.id);
+      expect(done.state).toBe('FAILED');
+      expect(await balance(p.db, acct.user(p.userId, n()))).toBe(amount);
+      expect(await balance(p.db, acct.inFlight(n()))).toBe(0n);
+      expect(await balance(p.db, acct.networkFees(n()))).toBe(await feePaid(env, done.settledTxid));
+      expect((await eventsOf(p.db, w.id)).at(-1)).toBe('BROADCAST>FAILED');
+    });
+
+    it('F5 an underfunded hot wallet delays the withdrawal, it does not fail it', async () => {
+      await p.close();
+      p = await openPipeline(env, { fundOnChain: false });
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const elapsed = after(1000);
+      await drive(p.deps, env, async () => {
+        expect(['APPROVED', 'RESERVED', 'SIGNED', 'BROADCAST']).toContain(await state(w.id));
+        return elapsed();
+      });
+      expect(['SIGNED', 'BROADCAST']).toContain(await state(w.id));
+      // a rejected re-send is recorded on the row, not as an event per poll
+      const [row] = await p.db<{ last_error: string | null }[]>`
+        select last_error from withdrawals where id = ${w.id}`;
+      expect(row?.last_error).toBeTruthy();
+      expect(await eventsOf(p.db, w.id)).not.toContain('rebroadcast');
+
+      await env.devnet.fund(p.hot.hotAddress, native, gasFloat(env) + amount);
+      await drive(p.deps, env, terminal(p.db, w.id));
+      expect(await state(w.id)).toBe('SETTLED');
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it('F6 attempts stop at maxAttempts', async () => {
+      const deps = { ...p.deps, timings: { ...p.deps.timings, stuckAfterMs: 200, maxAttempts: 3 } };
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const count = async () => (await attemptsOf(p.db, w.id)).length;
+      await driveWithoutMining(deps, async () => (await count()) === 3);
+      await driveWithoutMining(deps, after(1000)); // five more stuckAfterMs
+      expect(await count()).toBe(3);
+      expect(['SIGNED', 'BROADCAST']).toContain(await state(w.id));
+
+      await drive(deps, env, terminal(p.db, w.id));
+      const done = await getWithdrawal(p.db, w.id);
+      expect(done.state).toBe('SETTLED');
+      expect(await count()).toBe(3);
+      let confirmed = 0;
+      for (const a of await attemptsOf(p.db, w.id)) {
+        const s = await env.adapter.getTxStatus(a.txid);
+        if (s.state === 'confirmed') confirmed++;
+      }
+      expect(confirmed).toBe(1);
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
   });
 }
 
-// Holds the withdrawal's row lock until release() is called.
-async function lockRow(db: Db, id: string): Promise<{ release(): Promise<void> }> {
-  let locked!: () => void;
+// Holds the withdrawal's row lock until release() is called. `pid` is the holding session.
+async function lockRow(db: Db, id: string): Promise<{ pid: number; release(): Promise<void> }> {
+  let locked!: (pid: number) => void;
   let unlock!: () => void;
-  const ready = new Promise<void>((r) => (locked = r));
+  const ready = new Promise<number>((r) => (locked = r));
   const gate = new Promise<void>((r) => (unlock = r));
   const done = db.begin(async (tx) => {
-    await tx`select 1 from withdrawals where id = ${id} for update`;
-    locked();
+    const [row] = await tx<{ pid: number }[]>`
+      select pg_backend_pid() as pid from withdrawals where id = ${id} for update`;
+    if (!row) throw new Error(`withdrawal ${id} not found`);
+    locked(row.pid);
     await gate;
   });
-  await ready;
+  const pid = await ready;
   return {
+    pid,
     async release() {
       unlock();
       await done;
@@ -456,16 +688,20 @@ async function lockRow(db: Db, id: string): Promise<{ release(): Promise<void> }
   };
 }
 
-// Resolves once `n` sessions are blocked on a lock. Any statement counts, not only the update:
-// an insert that references the locked row waits on it too. Test files run in series, so the
-// only sessions in this database are this test's.
-async function lockWaiters(db: Db, n: number): Promise<void> {
+// Resolves once `n` sessions are blocked by the session `pid`, directly or through another
+// waiter: the first waiter on a row holds its tuple lock, so the second is blocked by the first.
+// Any statement counts, not only the update: an insert that references the row waits on it too.
+async function lockWaiters(db: Db, pid: number, n: number): Promise<void> {
   await waitFor(
-    `${n} sessions waiting on a lock`,
+    `${n} sessions blocked by ${pid}`,
     async () => {
       const [row] = await db<{ n: number }[]>`
-        select count(*)::int as n from pg_stat_activity
-        where wait_event_type = 'Lock' and datname = current_database()`;
+        with recursive blocked (pid) as (
+          select pid from pg_stat_activity where ${pid}::int = any(pg_blocking_pids(pid))
+          union
+          select a.pid from pg_stat_activity a join blocked b on b.pid = any(pg_blocking_pids(a.pid))
+        )
+        select count(*)::int as n from blocked`;
       return (row?.n ?? 0) >= n;
     },
     10_000,

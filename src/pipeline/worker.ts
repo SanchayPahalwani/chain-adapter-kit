@@ -96,7 +96,10 @@ export async function runOnce(deps: WorkerDeps, workerId: string): Promise<boole
   return true;
 }
 
-/** Runs until `signal` aborts. A database error ends the loop; the process supervisor restarts it. */
+/**
+ * Runs until `signal` aborts. Only a failed claim or release ends the loop early, and the process
+ * supervisor restarts it; a database error inside a handler is recorded like any other error.
+ */
 export async function runWorker(
   deps: WorkerDeps,
   workerId: string,

@@ -16,12 +16,15 @@ import type { Devnet } from '../../conformance/harness.js';
 import { testTokenAbi, testTokenBytecode } from './test-token.js';
 
 // anvil's dev account 0. Its key is published with Foundry and printed by every anvil at
-// start-up; it is used here only to deploy the test token and to mint it.
+// start-up; it is used here only to deploy the test token, and to mint and burn it.
 const DEV_ACCOUNT_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 
 export interface EvmDevnet extends Devnet {
   deployTestToken(): Promise<string>; // returns the contract address
   setNextBaseFee(wei: bigint): Promise<void>; // used by pipeline fault tests
+  // Takes `amount` of the test token away from `holder`, sent from the dev account and mined,
+  // so the holder's own nonce is untouched. Used to make a holder's transfer revert.
+  burnToken(token: string, holder: string, amount: bigint): Promise<void>;
 }
 
 export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
@@ -110,6 +113,17 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
       const { contractAddress } = await mineAndCheck(hash);
       if (!contractAddress) throw new Error(`deploy ${hash} created no contract`);
       return getAddress(contractAddress); // the receipt's address is lower-case
+    },
+
+    async burnToken(token: string, holder: string, amount: bigint) {
+      const hash = await client.writeContract({
+        address: token as Address,
+        abi: testTokenAbi,
+        functionName: 'burn',
+        args: [holder, amount],
+        nonce: await nextNonce(),
+      });
+      await mineAndCheck(hash);
     },
 
     async setNextBaseFee(wei: bigint) {

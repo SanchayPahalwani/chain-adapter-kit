@@ -21,8 +21,10 @@ import { publicKeyToAddress } from 'viem/accounts';
 import type {
   AssetId,
   ChainAdapter,
+  IncomingTransfer,
   InputStore,
   Json,
+  ScannedBlock,
   TransferIntent,
   TxStatus,
   UnsignedTx,
@@ -65,12 +67,26 @@ function toSerializable(body: Body): TransactionSerializableEIP1559 {
   };
 }
 
+function unsignedTx(body: Body): UnsignedTx {
+  const digest = keccak256(serializeTransaction(toSerializable(body)));
+  return { body, signingPayloads: [digest.slice(2)] }; // bare lower-case hex
+}
+
 // The node's own error text. Anything that is not the node answering (an HTTP error, a
-// timeout, a closed socket) is rethrown: it says nothing about the transaction.
+// timeout, a closed socket) is rethrown: it says nothing about the transaction. A JSON-RPC
+// error that came with a non-2xx status (viem sets `status`) is from a proxy or a failing
+// node, not a verdict, so it is rethrown too.
 function nodeAnswer(error: unknown): string {
   const rpc = error instanceof BaseError ? error.walk((e) => e instanceof RpcRequestError) : null;
-  if (!(rpc instanceof RpcRequestError)) throw error;
+  if (!(rpc instanceof RpcRequestError) || rpc.status !== undefined) throw error;
   return rpc.details;
+}
+
+// At least one eighth more, rounded up (geth requires 10% on both fee fields; anvil takes
+// any increase), and never below what the market asks now.
+function bumped(previous: string, market: bigint): string {
+  const raised = BigInt(previous) + (BigInt(previous) + 7n) / 8n;
+  return (raised > market ? raised : market).toString();
 }
 
 // For an unknown hash the node answers null and viem throws a typed error; turn it back into null.
@@ -217,8 +233,7 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
         maxFeePerGas,
         maxPriorityFeePerGas,
       };
-      const digest = keccak256(serializeTransaction(toSerializable(body)));
-      return { body, signingPayloads: [digest.slice(2)] }; // bare lower-case hex
+      return unsignedTx(body);
     },
 
     attachSignatures(unsigned: UnsignedTx, signatures: Uint8Array[]) {
@@ -237,8 +252,17 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       return { txid: keccak256(raw), raw };
     },
 
-    buildReplacement(): Promise<{ unsigned: UnsignedTx; fee: Json } | null> {
-      throw new Error('not implemented');
+    // Same nonce and every other field, higher fees: at most one of the two can confirm.
+    async buildReplacement(intent, reservation, previous) {
+      const body = previous.unsigned.body as Body;
+      const market = await client.estimateFeesPerGas();
+      const fee: Fee = {
+        gasLimit: body.gas,
+        maxFeePerGas: bumped(body.maxFeePerGas, market.maxFeePerGas),
+        maxPriorityFeePerGas: bumped(body.maxPriorityFeePerGas, market.maxPriorityFeePerGas),
+      };
+      const { maxFeePerGas, maxPriorityFeePerGas } = fee;
+      return { unsigned: unsignedTx({ ...body, maxFeePerGas, maxPriorityFeePerGas }), fee };
     },
 
     async broadcast({ txid, raw }) {
@@ -260,8 +284,43 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
 
     getTxStatus,
 
-    scanBlock(): Promise<never> {
-      throw new Error('not implemented');
+    // viem throws BlockNotFoundError for a height above the tip.
+    async scanBlock(height: number): Promise<ScannedBlock> {
+      const block = await client.getBlock({
+        blockNumber: BigInt(height),
+        includeTransactions: true,
+      });
+      const transfers: IncomingTransfer[] = [];
+      for (const tx of block.transactions) {
+        if (!tx.to || tx.value === 0n) continue;
+        // a value transfer can revert, and only its receipt says so
+        const receipt = await client.getTransactionReceipt({ hash: tx.hash });
+        if (receipt.blockHash !== block.hash)
+          throw new Error(`block ${height} changed in the scan`);
+        if (receipt.status !== 'success') continue;
+        const to = getAddress(tx.to);
+        transfers.push({ txid: tx.hash, index: 0, to, asset: 'native', amount: tx.value });
+      }
+      const logs =
+        tokens.size > 0
+          ? await client.getContractEvents({
+              abi: erc20Abi,
+              eventName: 'Transfer',
+              address: [...tokens],
+              blockHash: block.hash,
+              strict: true,
+            })
+          : [];
+      for (const { transactionHash: txid, logIndex: index, address, args } of logs) {
+        transfers.push({
+          txid,
+          index,
+          to: args.to,
+          asset: getAddress(address),
+          amount: args.value,
+        });
+      }
+      return { block: { height, hash: block.hash }, parentHash: block.parentHash, transfers };
     },
   };
 }

@@ -54,12 +54,17 @@ export function runConformanceSuite(
     await h.adapter.syncInputs(store, from.address);
     const reservation = await h.adapter.reserveInputs(store, intent, fee);
     const unsigned: UnsignedTx = await h.adapter.buildTransfer(intent, reservation, fee);
+    const { signed, signatures } = await sign(from, unsigned);
+    return { signed, unsigned, signatures, fee, reservation, intent };
+  }
+
+  async function sign(from: Wallet, unsigned: UnsignedTx) {
     const signatures: Uint8Array[] = [];
     for (const payload of unsigned.signingPayloads) {
       signatures.push(await h.signer.sign(from.keyId, h.adapter.curve, hexToBytes(payload)));
     }
     const signed: SignedTx = h.adapter.attachSignatures(unsigned, signatures);
-    return { signed, unsigned, signatures, fee, reservation, intent };
+    return { signed, signatures };
   }
 
   // One transfer of one unit from a fresh funded wallet to a fresh wallet.
@@ -178,6 +183,33 @@ export function runConformanceSuite(
       expect((await confirmed(signed.txid)).confirmations).toBe(3);
     });
 
+    it('C11 a dropped transaction reports unknown and can be sent again', async () => {
+      const { signed, to, intent } = await transfer(native());
+      expect(await h.adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+      await h.devnet.dropFromMempool(signed.txid);
+      expect(await h.adapter.getTxStatus(signed.txid)).toEqual({ state: 'unknown' });
+      expect(await h.adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+      await h.devnet.mine(1);
+      await confirmed(signed.txid);
+      expect(await h.adapter.getBalance(to, native())).toBe(intent.amount);
+    });
+
+    it('C12 a reorged-out transaction is not confirmed, and confirms again in a different block', async () => {
+      const { signed, to, intent } = await transfer(native());
+      expect(await h.adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+      await h.devnet.mine(1);
+      const first = await confirmed(signed.txid);
+
+      await h.devnet.reorg(1);
+      expect((await h.adapter.getTip()).height).toBeGreaterThanOrEqual(first.block.height);
+      expect((await h.adapter.getTxStatus(signed.txid)).state).not.toBe('confirmed');
+
+      expect(['accepted', 'already_known']).toContain((await h.adapter.broadcast(signed)).outcome);
+      await h.devnet.mine(1);
+      expect((await confirmed(signed.txid)).block.hash).not.toBe(first.block.hash);
+      expect(await h.adapter.getBalance(to, native())).toBe(intent.amount);
+    });
+
     it('C13 two reservations from one store do not conflict', async () => {
       const from = await fundedWallet(native());
       const store = new MemoryInputStore();
@@ -188,6 +220,52 @@ export function runConformanceSuite(
       await h.devnet.mine(1);
       await confirmed(a.signed.txid);
       await confirmed(b.signed.txid);
+    });
+
+    // The 'after-expiry' form is added with the first chain that needs it.
+    it('C14 an original and its replacement cannot both confirm', async ({ skip }) => {
+      if (h.replacement !== 'conflict') skip();
+      const { from, to, signed, unsigned, fee, reservation, intent } = await transfer(native());
+      expect(await h.adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+
+      const replacement = await h.adapter.buildReplacement(intent, reservation, { unsigned, fee });
+      if (!replacement) throw new Error('a conflict-rule adapter must return a replacement');
+      const rep = (await sign(from, replacement.unsigned)).signed;
+      expect(rep.txid).not.toBe(signed.txid);
+      expect(await h.adapter.broadcast(rep)).toEqual({ outcome: 'accepted' });
+      await h.devnet.mine(2);
+
+      const states = [signed, rep].map((tx) => h.adapter.getTxStatus(tx.txid));
+      const confirmedOnes = (await Promise.all(states)).filter((s) => s.state === 'confirmed');
+      expect(confirmedOnes).toHaveLength(1);
+      expect(await h.adapter.getBalance(to, native())).toBe(intent.amount);
+    });
+
+    it('C15 scanBlock reports incoming transfers, links hashes, and sees a reorg (every asset)', async () => {
+      for (const asset of h.assets) {
+        const { signed, to, intent } = await transfer(asset);
+        expect(await h.adapter.broadcast(signed), asset).toEqual({ outcome: 'accepted' });
+        await h.devnet.mine(1);
+        const tip = await h.adapter.getTip();
+
+        const scanned = await h.adapter.scanBlock(tip.height);
+        expect(scanned.block.hash, asset).toBe(tip.hash);
+        expect(scanned.transfers, asset).toContainEqual(
+          expect.objectContaining({ to, asset, amount: intent.amount, txid: signed.txid }),
+        );
+        expect(scanned.parentHash, asset).toBe(
+          (await h.adapter.scanBlock(tip.height - 1)).block.hash,
+        );
+
+        await h.devnet.reorg(1);
+        await h.devnet.mine(1);
+        const after = await h.adapter.scanBlock(tip.height);
+        expect(after.block.hash, asset).not.toBe(tip.hash);
+        expect(
+          after.transfers.map((t) => t.txid),
+          asset,
+        ).not.toContain(signed.txid);
+      }
     });
   });
 }

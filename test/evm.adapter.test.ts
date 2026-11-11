@@ -4,16 +4,20 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { hexToBytes } from '@noble/curves/utils.js';
+import { BlockNotFoundError, HttpRequestError } from 'viem';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEvmAdapter } from '../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../src/adapters/evm/devnet.js';
 import { config } from '../src/config.js';
-import type { ChainAdapter, InputStore, UnsignedTx } from '../src/core/adapter.js';
+import type { ChainAdapter, InputStore, Json, UnsignedTx } from '../src/core/adapter.js';
 import { LocalSigner } from '../src/core/local-signer.js';
 import { MemoryInputStore } from '../src/core/memory-input-store.js';
 
 type Reply =
-  { result: unknown } | { error: { code: number; message: string } } | 'http500' | 'hangup';
+  | { result: unknown }
+  | { error: { code: number; message: string }; status?: number }
+  | 'http500'
+  | 'hangup';
 type Script = Record<string, Reply[]>; // per method, replies in order; the last one repeats
 
 // A JSON-RPC server that answers chain id `chainId` and otherwise follows the current script
@@ -35,6 +39,7 @@ async function stubNode(chainId: string) {
         res.statusCode = 500;
         return void res.end('upstream says no');
       }
+      if ('status' in reply && reply.status) res.statusCode = reply.status;
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ jsonrpc: '2.0', id, ...reply }));
     });
@@ -115,9 +120,26 @@ describe('EVM adapter against a stub node', () => {
 
   it('broadcast throws on a transport failure instead of classifying it', async () => {
     node.play({ eth_sendRawTransaction: ['http500'] });
-    await expect(send()).rejects.toThrow();
+    await expect(send()).rejects.toThrow(HttpRequestError);
     node.play({ eth_sendRawTransaction: ['hangup'] });
-    await expect(send()).rejects.toThrow();
+    await expect(send()).rejects.toThrow(HttpRequestError);
+  });
+
+  it('broadcast throws on a JSON-RPC error that came with HTTP 500', async () => {
+    node.play({
+      eth_sendRawTransaction: [
+        { error: { code: -32003, message: 'upstream failed' }, status: 500 },
+      ],
+    });
+    await expect(send()).rejects.toThrow(/Status: 500/);
+  });
+
+  it('broadcast throws when the lookup after a send error fails in transport', async () => {
+    node.play({
+      eth_sendRawTransaction: [nodeSays('nonce too low: next nonce 5, tx nonce 3')],
+      eth_getTransactionReceipt: [{ result: null }, 'hangup'],
+    });
+    await expect(send()).rejects.toThrow(HttpRequestError);
   });
 
   it('broadcast answers already_known after a send error when the node has the txid', async () => {
@@ -194,20 +216,34 @@ describe('EVM adapter broadcast against anvil', () => {
     return { keyId, address: adapter.deriveAddress(await signer.publicKey(keyId, 'secp256k1')) };
   }
 
-  async function signedTransfer(from: { keyId: string; address: string }, store: InputStore) {
+  async function unsignedTransfer(
+    from: { address: string },
+    store: InputStore,
+    { to, amount = 1n, fee }: { to?: string; amount?: bigint; fee?: Json } = {},
+  ) {
     const intent = {
       from: from.address,
-      to: (await wallet()).address,
+      to: to ?? (await wallet()).address,
       asset: 'native',
-      amount: 1n,
+      amount,
     };
-    const fee = await adapter.quoteFee(intent);
+    fee ??= await adapter.quoteFee(intent);
     await adapter.syncInputs(store, from.address);
-    const unsigned = await adapter.buildTransfer(
+    const reservation = await adapter.reserveInputs(store, intent, fee);
+    return {
       intent,
-      await adapter.reserveInputs(store, intent, fee),
+      reservation,
       fee,
-    );
+      unsigned: await adapter.buildTransfer(intent, reservation, fee),
+    };
+  }
+
+  async function signedTransfer(
+    from: { keyId: string; address: string },
+    store: InputStore,
+    options?: { to?: string; amount?: bigint },
+  ) {
+    const { unsigned } = await unsignedTransfer(from, store, options);
     const payload = hexToBytes(unsigned.signingPayloads[0]!);
     return adapter.attachSignatures(unsigned, [
       await signer.sign(from.keyId, 'secp256k1', payload),
@@ -236,5 +272,66 @@ describe('EVM adapter broadcast against anvil', () => {
       outcome: 'rejected',
       reason: expect.stringMatching(/nonce too low/) as string,
     });
+  });
+
+  it('buildReplacement keeps every field but the fees, and bumps each by at least one eighth', async () => {
+    const from = await wallet();
+    const high = {
+      gasLimit: '21000',
+      maxFeePerGas: '800000000001',
+      maxPriorityFeePerGas: '1000000001',
+    };
+    const previous = await unsignedTransfer(from, new MemoryInputStore(), { fee: high });
+    const replacement = await adapter.buildReplacement(
+      previous.intent,
+      previous.reservation,
+      previous,
+    );
+    const fee = {
+      gasLimit: '21000',
+      maxFeePerGas: '900000000002',
+      maxPriorityFeePerGas: '1125000002',
+    };
+    expect(replacement?.fee).toEqual(fee);
+    expect(replacement?.unsigned.body).toEqual({
+      ...(previous.unsigned.body as object),
+      maxFeePerGas: fee.maxFeePerGas,
+      maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+    });
+  });
+
+  it('buildReplacement follows the market when it is above the bumped fee', async () => {
+    const from = await wallet();
+    const low = { gasLimit: '21000', maxFeePerGas: '8', maxPriorityFeePerGas: '1' };
+    const previous = await unsignedTransfer(from, new MemoryInputStore(), { fee: low });
+    const market = await adapter.quoteFee(previous.intent);
+    const replacement = await adapter.buildReplacement(
+      previous.intent,
+      previous.reservation,
+      previous,
+    );
+    expect(replacement?.fee).toEqual(market);
+  });
+
+  it('scanBlock skips reverted and zero-value transactions, and throws above the tip', async () => {
+    const token = await devnet.deployTestToken();
+    const [a, b] = [await wallet(), await wallet()];
+    await devnet.fund(a.address, 'native', 10n ** 18n);
+    await devnet.fund(b.address, 'native', 10n ** 18n);
+    // value sent to a contract with only the intrinsic 21000 gas runs out of gas and reverts
+    const reverted = await signedTransfer(a, new MemoryInputStore(), { to: token });
+    const zero = await signedTransfer(b, new MemoryInputStore(), { amount: 0n });
+    expect(await adapter.broadcast(reverted)).toEqual({ outcome: 'accepted' });
+    expect(await adapter.broadcast(zero)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+    expect(await adapter.getTxStatus(reverted.txid)).toMatchObject({ succeeded: false });
+    expect(await adapter.getTxStatus(zero.txid)).toMatchObject({ succeeded: true });
+
+    const tip = await adapter.getTip();
+    expect(await adapter.getTxStatus(zero.txid)).toMatchObject({ block: tip });
+    const scanned = (await adapter.scanBlock(tip.height)).transfers.map((t) => t.txid);
+    expect(scanned).not.toContain(reverted.txid);
+    expect(scanned).not.toContain(zero.txid);
+    await expect(adapter.scanBlock(tip.height + 1)).rejects.toThrow(BlockNotFoundError);
   });
 });

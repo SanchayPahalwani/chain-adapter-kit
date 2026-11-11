@@ -1,10 +1,12 @@
 import {
+  TransactionNotFoundError,
   createTestClient,
   getAddress,
   http,
   publicActions,
   walletActions,
   type Address,
+  type Hash,
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -75,12 +77,26 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
       await client.mine({ blocks });
     },
 
-    dropFromMempool(): Promise<void> {
-      throw new Error('not implemented');
+    async dropFromMempool(txid: string) {
+      const hash = txid as Hash;
+      await client.dropTransaction({ hash });
+      // anvil answers the same for a hash it does not hold, and leaves a nonce-gap tx in place
+      const still = await client.getTransaction({ hash }).catch((error: unknown) => {
+        if (error instanceof TransactionNotFoundError) return null;
+        throw error;
+      });
+      if (still) throw new Error(`${txid} is still known to the node after the drop`);
     },
 
-    reorg(): Promise<void> {
-      throw new Error('not implemented');
+    // Replaces the last `depth` blocks with empty ones at the same heights. Their
+    // transactions are gone, not back in the pool; what was in the pool stays there.
+    async reorg(depth: number) {
+      // viem has no wrapper for anvil_reorg
+      const request = client.request as (args: {
+        method: string;
+        params: unknown[];
+      }) => Promise<unknown>;
+      await request({ method: 'anvil_reorg', params: [depth, []] });
     },
 
     async deployTestToken() {

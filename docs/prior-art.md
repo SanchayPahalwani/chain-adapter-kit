@@ -67,13 +67,13 @@ Repositories: `github.com/coinbase/mesh-specifications` (`api.json`) and
 
 ## What this repo borrows
 
-| Idea | From | Where it appears here |
-|------|------|-----------------------|
-| Build, then expose the bytes to sign, then attach signatures | wallet-core's `preImageHashes` / `compile`; Mesh's `payloads` / `combine` | `buildTransfer` returns `signingPayloads`; `attachSignatures` |
-| The transaction id is available before broadcast | Mesh's `/construction/hash` | `attachSignatures` returns `txid` |
-| A conformance run that builds and broadcasts real transactions on a live chain | `mesh-cli check:construction` | `runConformanceSuite` against a local devnet |
-| Balance reconciliation as part of the checks | `mesh-cli check:data` | `reconcile` (ledger against chain) |
-| One module per chain behind one interface | all three | `src/adapters/<chain>/` |
+| Idea                                                                           | From                                                                      | Where it appears here                                         |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Build, then expose the bytes to sign, then attach signatures                   | wallet-core's `preImageHashes` / `compile`; Mesh's `payloads` / `combine` | `buildTransfer` returns `signingPayloads`; `attachSignatures` |
+| The transaction id is available before broadcast                               | Mesh's `/construction/hash`                                               | `attachSignatures` returns `txid`                             |
+| A conformance run that builds and broadcasts real transactions on a live chain | `mesh-cli check:construction`                                             | `runConformanceSuite` against a local devnet                  |
+| Balance reconciliation as part of the checks                                   | `mesh-cli check:data`                                                     | `reconcile` (ledger against chain)                            |
+| One module per chain behind one interface                                      | all three                                                                 | `src/adapters/<chain>/`                                       |
 
 ## Where it differs
 

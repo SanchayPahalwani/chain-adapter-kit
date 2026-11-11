@@ -1,6 +1,8 @@
+# Services are reached only from the host through published ports, so no project network is needed.
 services:
   postgres:
     image: postgres:17-alpine
+    network_mode: bridge
     environment:
       POSTGRES_USER: kit
       POSTGRES_PASSWORD: kit
@@ -8,13 +10,14 @@ services:
     ports:
       - '127.0.0.1:55432:5432'
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U kit']
+      test: ['CMD-SHELL', 'pg_isready -U kit -h 127.0.0.1']
       interval: 2s
       timeout: 3s
       retries: 30
 
   anvil:
     image: ghcr.io/foundry-rs/foundry:v1.9.0
+    network_mode: bridge
     entrypoint: ['anvil']
     command: ['--host', '0.0.0.0', '--no-mining']
     ports:

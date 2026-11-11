@@ -1,6 +1,2 @@
 .superpowers/
 node_modules/
-dist/
-coverage/
-.env
-docker-compose.override.yml

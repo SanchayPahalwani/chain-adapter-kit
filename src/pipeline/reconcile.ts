@@ -1,6 +1,6 @@
 import type { AssetId, TxStatus } from '../core/adapter.js';
 import type { Db, Tx } from './db.js';
-import { acct, balance, ledgerAsset } from './ledger.js';
+import { acct, ledgerAsset } from './ledger.js';
 import type { ChainRuntime } from './worker.js';
 
 export interface ReconcileRow {
@@ -31,10 +31,15 @@ interface AttemptRow {
 }
 type Confirmed = Extract<TxStatus, { state: 'confirmed' }>;
 
+const MAX_DETAIL = 5; // offenders named in a failed check's detail
+
 const toCheck = (name: string, bad: string[]): LedgerCheck => ({
   name,
   ok: bad.length === 0,
-  detail: bad.join('; '),
+  detail: [
+    ...bad.slice(0, MAX_DETAIL),
+    ...(bad.length > MAX_DETAIL ? [`and ${bad.length - MAX_DETAIL} more`] : []),
+  ].join('; '),
 });
 
 async function ledgerChecks(tx: Tx): Promise<LedgerCheck[]> {
@@ -77,25 +82,29 @@ async function ledgerChecks(tx: Tx): Promise<LedgerCheck[]> {
 
 /**
  * Compares each chain's `custody` balance with the hot wallet's on-chain balance, and checks the
- * ledger against itself. Reads only; never writes.
+ * ledger against itself. Reads only; never writes. Throws if `assets` names no chain and asset,
+ * since a comparison of nothing would report ok.
  */
 export async function reconcile(
   db: Db,
   chains: Record<string, ChainRuntime>,
   assets: Record<string, AssetId[]>,
 ): Promise<ReconcileReport> {
+  const runtimes = new Map<string, ChainRuntime>();
   for (const chain of Object.keys(assets)) {
-    if (!chains[chain]) throw new Error(`no chain runtime for ${chain}`);
+    const rt = chains[chain];
+    if (!rt) throw new Error(`no chain runtime for ${chain}`);
+    runtimes.set(chain, rt);
   }
+  const wanted = [...runtimes].flatMap(([chain, rt]) =>
+    (assets[chain] ?? []).map((asset) => ({ chain, asset, rt, la: ledgerAsset(chain, asset) })),
+  );
+  if (wanted.length === 0) throw new Error('reconcile: no chain and asset to compare');
+
   // One snapshot, so the custody balances, withdrawals and checks describe one instant.
   const snap = await db.begin('isolation level repeatable read read only', async (tx) => {
-    const custody = new Map<string, bigint>();
-    for (const [chain, list] of Object.entries(assets)) {
-      for (const asset of list) {
-        const a = ledgerAsset(chain, asset);
-        custody.set(a, await balance(tx, acct.custody(a)));
-      }
-    }
+    const custody = await tx<{ asset: string; balance: bigint }[]>`
+      select asset, balance from ledger_accounts where name = 'custody:' || asset order by asset`;
     const attempts = await tx<AttemptRow[]>`
       select w.id, w.chain, w.asset, w.amount, t.txid
         from withdrawals w join tx_attempts t on t.withdrawal_id = w.id
@@ -103,44 +112,48 @@ export async function reconcile(
        order by w.id, t.attempt_no`;
     return { custody, attempts, checks: await ledgerChecks(tx) };
   });
+  const custody = new Map(snap.custody.map((c) => [c.asset, c.balance]));
+  const covered = new Set(wanted.map((w) => w.la));
+  const uncovered = snap.custody
+    .filter((c) => c.balance !== 0n && !covered.has(c.asset))
+    .map((c) => `${acct.custody(c.asset)}: ${c.balance}`);
 
-  // The chain reads cannot be pinned to the snapshot's instant. A transfer that confirms or settles
-  // between the reads (or confirms between its status read and the balance read) can show as
-  // drift for one run: confirm a non-zero drift with a second run.
-  const hits = new Map<string, { at: AttemptRow; s: Confirmed }[]>();
+  // The database is read once, but the chain reads cannot be pinned to that instant. A transfer
+  // that confirms, or is reorganised out, between an attempt's status read and the balance read
+  // shows as drift for one run, and two attempts read at different tips could trip
+  // one_confirmed_attempt once. Confirm a failure with a second run.
+  const hits = new Map<string, { at: AttemptRow; s: Confirmed; n: number }>();
   for (const at of snap.attempts) {
-    const rt = chains[at.chain];
-    if (!rt || !(at.chain in assets)) continue;
+    const rt = runtimes.get(at.chain);
+    if (!rt) continue; // a chain not being reconciled
     const s = await rt.adapter.getTxStatus(at.txid);
-    if (s.state === 'confirmed') hits.set(at.id, [...(hits.get(at.id) ?? []), { at, s }]);
+    if (s.state === 'confirmed') hits.set(at.id, { at, s, n: (hits.get(at.id)?.n ?? 0) + 1 });
   }
   const explained = new Map<string, bigint>();
   const add = (a: string, v: bigint) => explained.set(a, (explained.get(a) ?? 0n) + v);
   const doubles: string[] = [];
-  for (const [id, list] of hits) {
-    const [hit] = list;
+  for (const [id, { at, s, n }] of hits) {
     // At most one attempt can confirm. If two do, what the ledger should hold is unknown: count neither.
-    if (!hit || list.length > 1) {
-      doubles.push(`withdrawal ${id}: ${list.length} attempts confirmed`);
+    if (n > 1) {
+      doubles.push(`withdrawal ${id}: ${n} attempts confirmed`);
       continue;
     }
-    if (hit.s.succeeded) add(ledgerAsset(hit.at.chain, hit.at.asset), -hit.at.amount);
-    add(ledgerAsset(hit.at.chain, 'native'), -hit.s.feePaid);
+    if (s.succeeded) add(ledgerAsset(at.chain, at.asset), -at.amount);
+    add(ledgerAsset(at.chain, 'native'), -s.feePaid);
   }
 
   const rows: ReconcileRow[] = [];
-  for (const [chain, list] of Object.entries(assets)) {
-    const rt = chains[chain];
-    if (!rt) continue; // checked above
-    for (const asset of list) {
-      const a = ledgerAsset(chain, asset);
-      const ledger = snap.custody.get(a) ?? 0n;
-      const onchain = await rt.adapter.getBalance(rt.hotAddress, asset);
-      const exp = explained.get(a) ?? 0n;
-      rows.push({ chain, asset, ledger, onchain, explained: exp, drift: onchain - ledger - exp });
-    }
+  for (const { chain, asset, rt, la } of wanted) {
+    const ledger = custody.get(la) ?? 0n;
+    const onchain = await rt.adapter.getBalance(rt.hotAddress, asset);
+    const exp = explained.get(la) ?? 0n;
+    rows.push({ chain, asset, ledger, onchain, explained: exp, drift: onchain - ledger - exp });
   }
-  const checks = [...snap.checks, toCheck('one_confirmed_attempt', doubles)];
+  const checks = [
+    ...snap.checks,
+    toCheck('custody_covered', uncovered),
+    toCheck('one_confirmed_attempt', doubles),
+  ];
   const ok = rows.every((r) => r.drift === 0n) && checks.every((c) => c.ok);
   return { rows, checks, ok };
 }

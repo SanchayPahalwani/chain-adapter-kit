@@ -21,6 +21,15 @@ export interface RequestFacts {
   recent24h: bigint; // the user's other non-rejected withdrawals of this asset in the window
 }
 
+// A bad policy is a configuration error, so it throws instead of rejecting requests.
+export function assertValidPolicy(p: AssetPolicy): void {
+  if (p.approvalsRequired < 1 || p.approvalsRequired > p.approvers.length) {
+    throw new Error(
+      `approvalsRequired must be between 1 and the ${p.approvers.length} approvers, got ${p.approvalsRequired}`,
+    );
+  }
+}
+
 // The checks that run before the hold, in order; the first failure wins.
 export function checkRequest(p: AssetPolicy, f: RequestFacts): RejectReason | null {
   if (!f.addressValid) return 'invalid_address';

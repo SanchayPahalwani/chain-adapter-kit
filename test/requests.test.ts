@@ -39,13 +39,15 @@ const deps: RequestDeps = {
   validateAddress: (_c, a) => a.startsWith('0xGOOD'),
 };
 
+let funding = 0;
 async function fund(user: string, n: bigint): Promise<void> {
-  await t.db.begin((tx) =>
-    post(tx, `fund:${user}`, 'fund', A, [
+  const ok = await t.db.begin((tx) =>
+    post(tx, `fund:${user}:${++funding}`, 'fund', A, [
       { account: acct.custody(A), side: 'debit', amount: n },
       { account: acct.user(user, A), side: 'credit', amount: n },
     ]),
   );
+  expect(ok).toBe(true);
 }
 const req = (key: string, amount: bigint, over: Partial<WithdrawalRequest> = {}) => ({
   idempotencyKey: key,
@@ -58,30 +60,57 @@ const req = (key: string, amount: bigint, over: Partial<WithdrawalRequest> = {})
 });
 const submit = (key: string, amount: bigint, over: Partial<WithdrawalRequest> = {}) =>
   submitWithdrawal(t.db, deps, req(key, amount, over));
-const decide = (withdrawalId: string, approverId: string, decision: 'approve' | 'reject') =>
-  decideApproval(t.db, deps, { withdrawalId, approverId, decision });
+const decide = (
+  withdrawalId: string,
+  approverId: string,
+  decision: 'approve' | 'reject',
+  using: RequestDeps = deps,
+) => decideApproval(t.db, using, { withdrawalId, approverId, decision });
+const withPolicy = (p: Partial<AssetPolicy>): RequestDeps => ({
+  ...deps,
+  policy: () => ({ ...policy, ...p }),
+});
 const userBal = (u = 'alice') => balance(t.db, acct.user(u, A));
 const inFlight = () => balance(t.db, acct.inFlight(A));
 async function count(sqlTable: 'withdrawals' | 'approvals' | 'ledger_txs'): Promise<number> {
   const [row] = await t.db<{ n: number }[]>`select count(*)::int as n from ${t.db(sqlTable)}`;
   return row?.n ?? -1;
 }
-// Holds the withdrawal's row lock for `ms`, so decisions started meanwhile all pass their own
-// start-up and then contend for the row at the same moment.
-async function lockRowFor(id: string, ms: number): Promise<{ done: Promise<unknown> }> {
+// Holds the withdrawal's row lock until release() is called, so decisions started meanwhile
+// queue on the row and then contend for it at the same moment.
+async function lockRow(id: string): Promise<{ release(): Promise<void> }> {
   let locked!: () => void;
+  let unlock!: () => void;
   const ready = new Promise<void>((r) => (locked = r));
+  const gate = new Promise<void>((r) => (unlock = r));
   const done = t.db.begin(async (tx) => {
     await tx`select 1 from withdrawals where id = ${id} for update`;
     locked();
-    await new Promise((r) => setTimeout(r, ms));
+    await gate;
   });
   await ready;
-  return { done };
+  return {
+    async release() {
+      unlock();
+      await done;
+    },
+  };
 }
-async function posted(ref: string): Promise<boolean> {
-  const rows = await t.db`select 1 from ledger_txs where ref = ${ref}`;
-  return rows.length === 1;
+// Resolves once `n` sessions of this test's schema are blocked on a lock.
+async function lockWaiters(n: number): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    const [row] = await t.db<{ n: number }[]>`
+      select count(*)::int as n from pg_stat_activity
+      where wait_event_type = 'Lock' and datname = current_database()
+        and query like '%withdrawals%'`;
+    if ((row?.n ?? 0) >= n) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`fewer than ${n} sessions ever waited on a lock`);
+}
+async function postingKind(ref: string): Promise<string | null> {
+  const [row] = await t.db<{ kind: string }[]>`select kind from ledger_txs where ref = ${ref}`;
+  return row?.kind ?? null;
 }
 
 describe('withdrawal requests', () => {
@@ -103,19 +132,21 @@ describe('withdrawal requests', () => {
     expect(await getWithdrawal(t.db, w.id)).toEqual(w);
     expect(await userBal()).toBe(1900n);
     expect(await inFlight()).toBe(100n);
-    expect(await posted(`hold:${w.id}`)).toBe(true);
+    expect(await postingKind(`hold:${w.id}`)).toBe('hold');
   });
 
   it('R2 the same key returns the same withdrawal and holds once', async () => {
-    const concurrent = await Promise.all(Array.from({ length: 10 }, () => submit('k2', 100n)));
-    const first = await submit('k2', 100n);
-    const second = await submit('k2', 100n);
-    const ids = new Set([...concurrent, first, second].map((w) => w.id));
-    expect(ids.size).toBe(1);
-    expect(second).toEqual(first);
+    // 300 ends AWAITING_APPROVAL, so a waiter that returned the provisional row would differ
+    const concurrent = await Promise.all(Array.from({ length: 10 }, () => submit('k2', 300n)));
+    const first = await submit('k2', 300n);
+    const second = await submit('k2', 300n);
+    const [stored] = concurrent;
+    expect(stored?.state).toBe('AWAITING_APPROVAL');
+    for (const w of [...concurrent, first, second]) expect(w).toEqual(stored);
+    expect(await getWithdrawal(t.db, first.id)).toEqual(stored);
     expect(await count('withdrawals')).toBe(1);
-    expect(await userBal()).toBe(1900n);
-    expect(await inFlight()).toBe(100n);
+    expect(await userBal()).toBe(1700n);
+    expect(await inFlight()).toBe(300n);
   });
 
   it('R3 rejects an invalid address, and one that is not allowlisted', async () => {
@@ -123,8 +154,8 @@ describe('withdrawal requests', () => {
     const unlisted = await submit('k3b', 100n, { to: '0xGOOD2' });
     expect([bad.state, bad.rejectReason]).toEqual(['REJECTED', 'invalid_address']);
     expect([unlisted.state, unlisted.rejectReason]).toEqual(['REJECTED', 'not_allowlisted']);
-    expect(await posted(`hold:${bad.id}`)).toBe(false);
-    expect(await posted(`hold:${unlisted.id}`)).toBe(false);
+    expect(await postingKind(`hold:${bad.id}`)).toBeNull();
+    expect(await postingKind(`hold:${unlisted.id}`)).toBeNull();
     expect(await userBal()).toBe(2000n);
     expect(await inFlight()).toBe(0n);
   });
@@ -169,7 +200,7 @@ describe('withdrawal requests', () => {
     const w = await submit('k7', 100n, { userId: 'bob' });
     expect([w.state, w.rejectReason]).toEqual(['REJECTED', 'insufficient_funds']);
     expect(await getWithdrawal(t.db, w.id)).toEqual(w);
-    expect(await posted(`hold:${w.id}`)).toBe(false);
+    expect(await postingKind(`hold:${w.id}`)).toBeNull();
     expect(await userBal('bob')).toBe(50n);
     expect(await inFlight()).toBe(0n);
   });
@@ -200,7 +231,7 @@ describe('withdrawal requests', () => {
     const below = await submit('k10a', 299n);
     const at = await submit('k10b', 300n);
     expect([below.state, at.state]).toEqual(['APPROVED', 'AWAITING_APPROVAL']);
-    expect(await posted(`hold:${at.id}`)).toBe(true);
+    expect(await postingKind(`hold:${at.id}`)).toBe('hold');
     expect(await userBal()).toBe(1401n);
   });
 
@@ -208,16 +239,15 @@ describe('withdrawal requests', () => {
     const w = await submit('k11', 300n);
     expect((await decide(w.id, 'ops1', 'approve')).state).toBe('AWAITING_APPROVAL');
     expect((await decide(w.id, 'ops1', 'approve')).state).toBe('AWAITING_APPROVAL');
-    // one decision per approver: the first one stands
-    expect((await decide(w.id, 'ops1', 'reject')).state).toBe('AWAITING_APPROVAL');
     expect((await decide(w.id, 'ops2', 'approve')).state).toBe('APPROVED');
     expect(await count('approvals')).toBe(2);
 
     // two approvers at once: the row lock orders them, so the second counts the first's vote
     const v = await submit('k11b', 300n);
-    const gate = await lockRowFor(v.id, 150);
+    const gate = await lockRow(v.id);
     const both = Promise.all([decide(v.id, 'ops1', 'approve'), decide(v.id, 'ops3', 'approve')]);
-    await gate.done;
+    await lockWaiters(2);
+    await gate.release();
     const states = (await both).map((x) => x.state).sort();
     expect(states).toEqual(['APPROVED', 'AWAITING_APPROVAL']);
     expect(await userBal()).toBe(1400n);
@@ -228,7 +258,7 @@ describe('withdrawal requests', () => {
     await decide(w.id, 'ops1', 'approve');
     const r = await decide(w.id, 'ops2', 'reject');
     expect([r.state, r.rejectReason]).toEqual(['REJECTED', 'rejected_by_approver']);
-    expect(await posted(`release:${w.id}`)).toBe(true);
+    expect(await postingKind(`release:${w.id}`)).toBe('release');
     expect(await userBal()).toBe(2000n);
     expect(await inFlight()).toBe(0n);
 
@@ -236,17 +266,18 @@ describe('withdrawal requests', () => {
     // being rejected, since that rejection has not committed: 400 + 400 + 400 > 1000.
     const v = await submit('k12b', 400n);
     await submit('k12c', 400n);
-    const gate = await lockRowFor(v.id, 150);
+    const gate = await lockRow(v.id);
     const rejections = Promise.all([
       decide(v.id, 'ops1', 'reject'),
       decide(v.id, 'ops3', 'reject'),
     ]);
+    await lockWaiters(2);
     const racing = await submit('k12d', 400n);
-    await gate.done;
+    await gate.release();
     const [a, b] = await rejections;
     expect([racing.state, racing.rejectReason]).toEqual(['REJECTED', 'over_24h_limit']);
     expect([a.state, b.state]).toEqual(['REJECTED', 'REJECTED']);
-    expect(await posted(`release:${v.id}`)).toBe(true);
+    expect(await postingKind(`release:${v.id}`)).toBe('release');
     expect(await userBal()).toBe(1600n);
     expect(await inFlight()).toBe(400n);
   });
@@ -275,7 +306,7 @@ describe('withdrawal requests', () => {
     expect(await decide(bad.id, 'ops1', 'approve')).toEqual(bad);
 
     expect(await count('approvals')).toBe(2);
-    expect(await posted(`release:${w.id}`)).toBe(false);
+    expect(await postingKind(`release:${w.id}`)).toBeNull();
     expect(await userBal()).toBe(1600n);
   });
 
@@ -287,5 +318,99 @@ describe('withdrawal requests', () => {
     expect(rejected.map((w) => w.rejectReason)).toEqual(['over_24h_limit', 'over_24h_limit']);
     expect(await userBal()).toBe(1100n);
     expect(await inFlight()).toBe(900n);
+  });
+
+  it('R16 an approver who approved can still reject, and the reject ends the withdrawal', async () => {
+    const w = await submit('k16', 300n);
+    await decide(w.id, 'ops1', 'approve');
+    const r = await decide(w.id, 'ops1', 'reject');
+    expect([r.state, r.rejectReason]).toEqual(['REJECTED', 'rejected_by_approver']);
+    expect(await postingKind(`release:${w.id}`)).toBe('release');
+    const rows =
+      await t.db`select approver_id, decision from approvals where withdrawal_id = ${w.id}`;
+    expect(rows).toEqual([{ approver_id: 'ops1', decision: 'reject' }]);
+    expect(await userBal()).toBe(2000n);
+    expect(await inFlight()).toBe(0n);
+  });
+
+  it('R17 a repeated approve re-evaluates the count after a policy correction', async () => {
+    const strict = withPolicy({ approvalsRequired: 3 });
+    const w = await submit('k17', 300n);
+    await decide(w.id, 'ops1', 'approve', strict);
+    expect((await decide(w.id, 'ops2', 'approve', strict)).state).toBe('AWAITING_APPROVAL');
+    expect((await decide(w.id, 'ops2', 'approve')).state).toBe('APPROVED');
+    expect(await count('approvals')).toBe(2);
+  });
+
+  it('R18 the same key used by two users gives two withdrawals', async () => {
+    await fund('bob', 500n);
+    await allowAddress(t.db, 'bob', CHAIN, '0xGOOD1');
+    const a = await submit('shared', 100n);
+    const b = await submit('shared', 100n, { userId: 'bob' });
+    expect(a.id).not.toBe(b.id);
+    expect([a.state, b.state]).toEqual(['APPROVED', 'APPROVED']);
+    expect(await userBal()).toBe(1900n);
+    expect(await userBal('bob')).toBe(400n);
+  });
+
+  it('R19 concurrent requests within the 24-hour limit cannot overdraw the balance', async () => {
+    await fund('bob', 250n);
+    await allowAddress(t.db, 'bob', CHAIN, '0xGOOD1');
+    const all = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => submit(`k19:${i}`, 100n, { userId: 'bob' })),
+    );
+    const accepted = all.filter((w) => w.state === 'APPROVED');
+    const rejected = all.filter((w) => w.state === 'REJECTED');
+    expect(accepted).toHaveLength(2);
+    expect(rejected.map((w) => w.rejectReason)).toEqual([
+      'insufficient_funds',
+      'insufficient_funds',
+      'insufficient_funds',
+    ]);
+    for (const w of rejected) expect(await postingKind(`hold:${w.id}`)).toBeNull();
+    expect(await userBal('bob')).toBe(50n);
+    expect(await inFlight()).toBe(200n);
+  });
+
+  it('R20 an amount of zero or less throws RangeError and does not consume the key', async () => {
+    await expect(submit('k20', 0n)).rejects.toThrow(RangeError);
+    await expect(submit('k20', -5n)).rejects.toThrow(/amount must be positive/);
+    expect(await count('withdrawals')).toBe(0);
+    expect((await submit('k20', 100n)).state).toBe('APPROVED');
+  });
+
+  it('R21 a bad or unknown policy throws before anything is written', async () => {
+    for (const bad of [{ approvalsRequired: 0 }, { approvalsRequired: 4 }]) {
+      const using = withPolicy(bad);
+      await expect(submitWithdrawal(t.db, using, req('k21', 300n))).rejects.toThrow(
+        /approvalsRequired must be between 1 and the 3 approvers/,
+      );
+    }
+    const unknown: RequestDeps = {
+      ...deps,
+      policy: (c, a) => {
+        throw new Error(`no policy for ${c}/${a}`);
+      },
+    };
+    await expect(submitWithdrawal(t.db, unknown, req('k21', 300n))).rejects.toThrow(/no policy/);
+    expect(await count('withdrawals')).toBe(0);
+
+    const w = await submit('k21', 300n);
+    await expect(
+      decide(w.id, 'ops1', 'approve', withPolicy({ approvalsRequired: 4 })),
+    ).rejects.toThrow(/approvalsRequired/);
+    expect(await count('approvals')).toBe(0);
+  });
+
+  it('R22 a decision on an unknown or malformed withdrawal id throws a clear error', async () => {
+    const missing = '00000000-0000-4000-8000-000000000000';
+    await expect(decide(missing, 'ops1', 'approve')).rejects.toThrow(
+      `withdrawal ${missing} not found`,
+    );
+    await expect(decide('nope', 'ops1', 'approve')).rejects.toThrow(
+      '"nope" is not a withdrawal id',
+    );
+    await expect(getWithdrawal(t.db, 'nope')).rejects.toThrow('"nope" is not a withdrawal id');
+    expect(await count('approvals')).toBe(0);
   });
 });

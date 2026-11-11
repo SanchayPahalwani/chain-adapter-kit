@@ -2,6 +2,7 @@ import type { Json } from '../core/adapter.js';
 import type { Db, Queryable, Tx } from './db.js';
 import { acct, InsufficientFunds, ledgerAsset, lockAccount, post } from './ledger.js';
 import {
+  assertValidPolicy,
   canApprove,
   checkRequest,
   needsApproval,
@@ -65,7 +66,15 @@ export function rowToWithdrawal(row: Record<string, unknown>): Withdrawal {
   };
 }
 
+// Checked before querying, so a malformed id gives this error rather than Postgres 22P02.
+function assertWithdrawalId(id: string): void {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    throw new Error(`${JSON.stringify(id)} is not a withdrawal id`);
+  }
+}
+
 export async function getWithdrawal(sql: Queryable, id: string): Promise<Withdrawal> {
+  assertWithdrawalId(id);
   const [row] = await sql`select * from withdrawals where id = ${id}`;
   if (!row) throw new Error(`withdrawal ${id} not found`);
   return rowToWithdrawal(row);
@@ -132,12 +141,17 @@ async function placeHold(tx: Tx, w: Withdrawal, a: string): Promise<RejectReason
   }
 }
 
-export function submitWithdrawal(
+export async function submitWithdrawal(
   db: Db,
   deps: RequestDeps,
   req: WithdrawalRequest,
 ): Promise<Withdrawal> {
-  return db.begin(async (tx) => {
+  if (req.amount <= 0n) throw new RangeError(`amount must be positive, got ${req.amount}`);
+  const p = deps.policy(req.chain, req.asset);
+  assertValidPolicy(p);
+  return await db.begin(async (tx) => {
+    // 'APPROVED' is provisional: the row is uncommitted and invisible to everyone else until this
+    // transaction sets its final state and commits.
     const [row] = await tx`
       insert into withdrawals (user_id, idempotency_key, chain, asset, to_address, amount, state)
       values (${req.userId}, ${req.idempotencyKey}, ${req.chain}, ${req.asset}, ${req.to},
@@ -150,16 +164,15 @@ export function submitWithdrawal(
     // Serialises this user's requests for the asset, so the 24-hour sum below cannot be raced.
     await lockAccount(tx, acct.user(w.userId, a), a);
 
-    const p = deps.policy(w.chain, w.asset);
     const listed = await tx`
       select 1 from allowlist where user_id = ${w.userId} and chain = ${w.chain} and address = ${w.to}`;
-    const reason =
-      checkRequest(p, {
-        addressValid: deps.validateAddress(w.chain, w.to),
-        allowlisted: listed.length > 0,
-        amount: w.amount,
-        recent24h: await recentTotal(tx, w),
-      }) ?? (await placeHold(tx, w, a));
+    let reason = checkRequest(p, {
+      addressValid: deps.validateAddress(w.chain, w.to),
+      allowlisted: listed.length > 0,
+      amount: w.amount,
+      recent24h: await recentTotal(tx, w),
+    });
+    if (!reason) reason = await placeHold(tx, w, a);
 
     if (reason) return setState(tx, w.id, 'APPROVED', 'REJECTED', reason);
     if (needsApproval(p, w.amount))
@@ -168,26 +181,30 @@ export function submitWithdrawal(
   });
 }
 
-export function decideApproval(
+export async function decideApproval(
   db: Db,
   deps: RequestDeps,
   d: { withdrawalId: string; approverId: string; decision: 'approve' | 'reject' },
 ): Promise<Withdrawal> {
-  return db.begin(async (tx) => {
+  assertWithdrawalId(d.withdrawalId);
+  return await db.begin(async (tx) => {
     const [row] = await tx`select * from withdrawals where id = ${d.withdrawalId} for update`;
     if (!row) throw new Error(`withdrawal ${d.withdrawalId} not found`);
     const w = rowToWithdrawal(row);
     if (w.state !== 'AWAITING_APPROVAL') return w;
     const p = deps.policy(w.chain, w.asset);
+    assertValidPolicy(p);
     if (!canApprove(p, d.approverId, w.userId)) {
       throw new NotAnApprover(`${d.approverId} cannot decide withdrawal ${w.id}`);
     }
 
-    const inserted = await tx`
+    // One row per approver. A later reject replaces an earlier approve; a repeated approve
+    // changes nothing but the count below still runs.
+    await tx`
       insert into approvals (withdrawal_id, approver_id, decision)
       values (${w.id}, ${d.approverId}, ${d.decision})
-      on conflict do nothing`;
-    if (inserted.count === 0) return w; // this approver already decided; the first decision stands
+      on conflict (withdrawal_id, approver_id) do update set decision = 'reject', created_at = now()
+      where approvals.decision = 'approve' and excluded.decision = 'reject'`;
 
     if (d.decision === 'reject') {
       const a = ledgerAsset(w.chain, w.asset);

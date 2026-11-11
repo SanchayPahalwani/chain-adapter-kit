@@ -7,6 +7,7 @@ export interface Line {
   amount: bigint;
 }
 
+// In acct.*, `a` is a ledgerAsset() string; every account name ends in `:${asset}`.
 export const ledgerAsset = (chain: string, asset: string) => `${chain}:${asset}`;
 export const acct = {
   custody: (a: string) => `custody:${a}`, // normal side: debit
@@ -17,6 +18,7 @@ export const acct = {
 };
 
 export class InsufficientFunds extends Error {
+  override name = 'InsufficientFunds';
   constructor(readonly account: string) {
     super(`insufficient funds in ${account}`);
   }
@@ -30,6 +32,11 @@ function normalSide(account: string): Side {
   throw new Error(`unknown ledger account ${account}`);
 }
 
+// Checked before any write, so a wrong-asset call cannot leave half a posting behind.
+function checkAsset(account: string, asset: string): void {
+  if (!account.endsWith(`:${asset}`)) throw new Error(`${account} is not an ${asset} account`);
+}
+
 // A concurrent creator makes this wait until it commits, then do nothing.
 async function ensureAccount(tx: Tx, account: string, asset: string): Promise<void> {
   await tx`
@@ -38,11 +45,16 @@ async function ensureAccount(tx: Tx, account: string, asset: string): Promise<vo
     on conflict (name) do nothing`;
 }
 
+/**
+ * Lock an account row for the rest of the transaction, creating it if needed.
+ * Call it before any `post` in the transaction, and afterwards post only to accounts whose names
+ * sort at or after the locked one (the request path locks `user:...`, then posts `user:...` and
+ * `withdrawals_in_flight:...`). A caller that breaks this can deadlock; Postgres aborts one side.
+ */
 export async function lockAccount(tx: Tx, account: string, asset: string): Promise<void> {
+  checkAsset(account, asset);
   await ensureAccount(tx, account, asset);
-  const rows =
-    await tx`select 1 from ledger_accounts where name = ${account} and asset = ${asset} for update`;
-  if (rows.length === 0) throw new Error(`${account} exists in another asset than ${asset}`);
+  await tx`select 1 from ledger_accounts where name = ${account} for update`;
 }
 
 export async function balance(sql: Queryable, account: string): Promise<bigint> {
@@ -52,8 +64,12 @@ export async function balance(sql: Queryable, account: string): Promise<bigint> 
   return rows[0]?.balance ?? 0n;
 }
 
-// Never commits or opens a transaction: it runs inside the caller's. Throwing (unbalanced lines,
-// InsufficientFunds) leaves the caller's transaction to roll back.
+/**
+ * Posts a balanced entry set inside the caller's transaction; it never commits or begins one.
+ * Returns false and changes nothing if `ref` was already posted.
+ * InsufficientFunds comes from a failed statement, so the surrounding transaction is aborted;
+ * a caller that wants to record a rejection must run `post` inside a savepoint.
+ */
 export async function post(
   tx: Tx,
   ref: string,
@@ -61,18 +77,18 @@ export async function post(
   asset: string,
   lines: Line[],
 ): Promise<boolean> {
-  // change per account: lines on the account's normal side add, the others subtract
-  const delta = new Map<string, bigint>();
-  let net = 0n;
+  if (lines.length === 0) throw new Error(`posting ${ref} has no lines`);
+  let net = 0n; // debits minus credits over the whole posting; must be zero
+  const delta = new Map<string, bigint>(); // change per account: its normal side adds, the other subtracts
   for (const l of lines) {
     if (l.amount <= 0n) throw new Error(`line amount must be positive, got ${l.amount}`);
-    const sign = l.side === 'debit' ? 1n : -1n;
-    net += sign * l.amount;
-    const own = l.side === normalSide(l.account) ? 1n : -1n;
-    delta.set(l.account, (delta.get(l.account) ?? 0n) + own * l.amount);
+    checkAsset(l.account, asset);
+    net += l.side === 'debit' ? l.amount : -l.amount;
+    const change = l.side === normalSide(l.account) ? l.amount : -l.amount;
+    delta.set(l.account, (delta.get(l.account) ?? 0n) + change);
   }
-  if (lines.length === 0 || net !== 0n)
-    throw new Error(`postings must balance: ${ref} is off by ${net}`);
+  if (net !== 0n)
+    throw new Error(`posting ${ref} does not balance: debits minus credits is ${net}`);
 
   // A second transaction with the same ref waits here for the first to commit, then gets no row.
   const [row] = await tx<{ id: string }[]>`
@@ -80,16 +96,17 @@ export async function post(
     on conflict (ref) do nothing returning id`;
   if (!row) return false;
 
-  // Sorted by name, so two postings touching the same accounts lock them in the same order.
+  // Sorted by name, so two single posts touching the same accounts lock them in the same order.
+  // A transaction that makes several post calls should make them in a consistent order too.
   for (const account of [...delta.keys()].sort()) {
     await ensureAccount(tx, account, asset);
     try {
-      const rows = await tx`
-        update ledger_accounts set balance = balance + ${delta.get(account) ?? 0n}
-        where name = ${account} and asset = ${asset}`;
-      if (rows.count === 0) throw new Error(`${account} exists in another asset than ${asset}`);
+      await tx`update ledger_accounts set balance = balance + ${delta.get(account) ?? 0n} where name = ${account}`;
     } catch (e) {
-      if ((e as { code?: string }).code === '23514') throw new InsufficientFunds(account);
+      const err = e as { code?: string; constraint_name?: string };
+      if (err.code === '23514' && err.constraint_name === 'ledger_accounts_balance_check') {
+        throw new InsufficientFunds(account);
+      }
       throw e;
     }
   }

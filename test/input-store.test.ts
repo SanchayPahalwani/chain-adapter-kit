@@ -62,29 +62,38 @@ describe('pg input store', () => {
     let abortA!: () => void;
     const aGate = new Promise<void>((r) => (abortA = r));
 
-    const a = t.db
-      .begin(async (tx) => {
-        expect(await pgInputStore(tx, holder).nextSequence('i4')).toBe(5n);
-        aTookIt();
-        await aGate;
-        throw new Error('abort');
-      })
-      .then(
-        () => undefined,
-        (e: unknown) => e,
-      );
-    await Promise.race([aReady, a]);
+    const a = t.db.begin(async (tx) => {
+      expect(await pgInputStore(tx, holder).nextSequence('i4')).toBe(5n);
+      aTookIt();
+      await aGate;
+      throw new Error('abort');
+    });
+    a.catch(() => undefined); // checked below; this keeps an early failure from going unhandled
+    await Promise.race([aReady, a]); // if A fails before the gate, its own error ends the test here
 
     // B asks while A holds the row lock
-    const b = t.db.begin((tx) => pgInputStore(tx, holder).nextSequence('i4'));
+    let bPid: number | undefined;
+    let bFailed = false;
+    const b = t.db.begin(async (tx) => {
+      const [p] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      bPid = p?.pid;
+      return pgInputStore(tx, holder).nextSequence('i4');
+    });
+    b.catch(() => {
+      bFailed = true;
+      abortA(); // do not leave A open if B failed
+    });
     for (let i = 0; ; i++) {
-      const waiting = await t.db`select 1 from pg_locks where not granted`;
-      if (waiting.length > 0) break;
+      if (bFailed) await b; // fails the test now with B's own error
+      if (bPid !== undefined) {
+        const waiting = await t.db`select 1 from pg_locks where not granted and pid = ${bPid}`;
+        if (waiting.length > 0) break;
+      }
       if (i > 200) throw new Error('B never blocked behind A');
       await new Promise((r) => setTimeout(r, 25));
     }
     abortA();
-    expect(((await a) as Error).message).toBe('abort');
+    await expect(a).rejects.toThrow('abort');
     expect(await b).toBe(5n);
     await expect(pgInputStore(t.db, holder).nextSequence('never')).rejects.toThrow(/never seeded/);
   });
@@ -138,7 +147,7 @@ describe('pg input store', () => {
     await store.reserveCoins(['r1']);
     const [row] = await t.db`select reserved_by from chain_coins where id = 'r1'`;
     expect(row?.reserved_by).toBe(holder);
-    await expect(store.reserveCoins(['nope'])).rejects.toThrow();
+    await expect(store.reserveCoins(['nope'])).rejects.toThrow(/could not reserve all of nope/);
     await expect(pgInputStore(t.db, 'other').reserveCoins(['r1', 'r2'])).rejects.toThrow(/r1/);
     expect((await store.freeCoins('i7')).map((c) => c.id)).toEqual(['r2']);
   });
@@ -152,12 +161,16 @@ describe('pg input store', () => {
     await store.reserveCoins(['d3']);
 
     // (a) bare pool: d1 is free, d3 is taken
-    await expect(store.reserveCoins(['d1', 'd3'])).rejects.toThrow();
+    await expect(store.reserveCoins(['d1', 'd3'])).rejects.toThrow(
+      /could not reserve all of d1, d3/,
+    );
     expect(await free()).toEqual(['d1', 'd2']);
 
     // (b) the caller catches the error and commits anyway
     await t.db.begin(async (tx) => {
-      await expect(pgInputStore(tx, holder).reserveCoins(['d2', 'd3'])).rejects.toThrow();
+      await expect(pgInputStore(tx, holder).reserveCoins(['d2', 'd3'])).rejects.toThrow(
+        /could not reserve all of d2, d3/,
+      );
     });
     expect(await free()).toEqual(['d1', 'd2']);
 
@@ -181,10 +194,20 @@ describe('pg input store', () => {
       const applied = await p1`select name from schema_migrations`;
       expect(applied.length).toBe(1);
     } finally {
-      await p1.end();
-      await p2.end();
-      await admin`drop schema if exists ${admin(schema)} cascade`;
-      await admin.end();
+      // each step runs even if the one before it rejects
+      try {
+        await p1.end({ timeout: 5 });
+      } finally {
+        try {
+          await p2.end({ timeout: 5 });
+        } finally {
+          try {
+            await admin`drop schema if exists ${admin(schema)} cascade`;
+          } finally {
+            await admin.end({ timeout: 5 });
+          }
+        }
+      }
     }
   });
 });

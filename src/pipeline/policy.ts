@@ -23,7 +23,11 @@ export interface RequestFacts {
 
 // A bad policy is a configuration error, so it throws instead of rejecting requests.
 export function assertValidPolicy(p: AssetPolicy): void {
-  if (p.approvalsRequired < 1 || p.approvalsRequired > p.approvers.length) {
+  if (
+    !Number.isInteger(p.approvalsRequired) ||
+    p.approvalsRequired < 1 ||
+    p.approvalsRequired > p.approvers.length
+  ) {
     throw new Error(
       `approvalsRequired must be between 1 and the ${p.approvers.length} approvers, got ${p.approvalsRequired}`,
     );

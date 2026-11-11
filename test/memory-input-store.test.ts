@@ -53,7 +53,7 @@ describe('MemoryInputStore', () => {
   it('reserveCoins rejects a duplicate id and leaves the coin free', async () => {
     const store = new MemoryInputStore();
     await store.putCoins([coin('a')]);
-    await expect(store.reserveCoins(['a', 'a'])).rejects.toThrow(/duplicate/);
+    await expect(store.reserveCoins(['a', 'a'])).rejects.toThrow(/duplicate coin id a /);
     expect((await store.freeCoins('alice')).map((c) => c.id)).toEqual(['a']);
   });
 });

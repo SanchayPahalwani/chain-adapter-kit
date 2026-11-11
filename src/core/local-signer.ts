@@ -13,7 +13,7 @@ export class LocalSigner implements Signer {
 
   constructor(seed: Uint8Array) {
     if (seed.length !== 32) throw new Error('seed must be 32 bytes');
-    this.seed = seed.slice();
+    this.seed = Uint8Array.from(seed); // slice() on a Node Buffer is a view, not a copy
     this.seedHex = bytesToHex(seed);
   }
 

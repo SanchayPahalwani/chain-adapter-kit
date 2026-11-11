@@ -20,7 +20,10 @@ const numericAsBigint = {
 export function connect(url: string, schema?: string): Db {
   return postgres(url, {
     types: { numeric: numericAsBigint },
-    onnotice: () => {}, // "already exists, skipping" and "drop cascades" are expected
+    // "already exists, skipping" and "drop cascades" are expected NOTICEs; anything else is not
+    onnotice: (n) => {
+      if (n.severity !== 'NOTICE') console.warn(`postgres ${n.severity}: ${n.message}`);
+    },
     connection: schema ? { search_path: schema } : {},
   });
 }

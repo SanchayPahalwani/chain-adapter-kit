@@ -31,7 +31,11 @@ export class MemoryInputStore implements InputStore {
 
   async reserveCoins(ids: string[]): Promise<void> {
     // check all first so a failed call reserves nothing
-    if (new Set(ids).size !== ids.length) throw new Error('duplicate coin id in reservation');
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) throw new Error(`duplicate coin id ${id} in reservation`);
+      seen.add(id);
+    }
     const entries = ids.map((id) => {
       const entry = this.coins.get(id);
       if (!entry) throw new Error(`coin ${id} does not exist`);

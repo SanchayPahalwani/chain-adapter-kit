@@ -380,7 +380,12 @@ describe('withdrawal requests', () => {
   });
 
   it('R21 a bad or unknown policy throws before anything is written', async () => {
-    for (const bad of [{ approvalsRequired: 0 }, { approvalsRequired: 4 }]) {
+    for (const bad of [
+      { approvalsRequired: 0 },
+      { approvalsRequired: 4 },
+      { approvalsRequired: 1.5 },
+      { approvalsRequired: Number.NaN },
+    ]) {
       const using = withPolicy(bad);
       await expect(submitWithdrawal(t.db, using, req('k21', 300n))).rejects.toThrow(
         /approvalsRequired must be between 1 and the 3 approvers/,
@@ -400,6 +405,34 @@ describe('withdrawal requests', () => {
       decide(w.id, 'ops1', 'approve', withPolicy({ approvalsRequired: 4 })),
     ).rejects.toThrow(/approvalsRequired/);
     expect(await count('approvals')).toBe(0);
+  });
+
+  it('R21b an approve racing a reject ends in one consistent state', async () => {
+    const outcomes = new Set<string>();
+    for (let i = 0; i < 10; i++) {
+      const user = `racer${i}`; // own user each round, so the 24-hour limit never interferes
+      await fund(user, 500n);
+      await allowAddress(t.db, user, CHAIN, '0xGOOD1');
+      const w = await submit(`k21b:${i}`, 300n, { userId: user });
+      await decide(w.id, 'ops1', 'approve'); // one more approval is needed
+      const [approve, reject] = await Promise.all([
+        decide(w.id, 'ops2', 'approve'),
+        decide(w.id, 'ops3', 'reject'),
+      ]);
+      expect(approve).toEqual(reject);
+      expect(await getWithdrawal(t.db, w.id)).toEqual(approve);
+      outcomes.add(approve.state);
+      expect(await postingKind(`hold:${w.id}`)).toBe('hold');
+      if (approve.state === 'APPROVED') {
+        expect(await postingKind(`release:${w.id}`)).toBeNull();
+        expect(await userBal(user)).toBe(200n);
+      } else {
+        expect([approve.state, approve.rejectReason]).toEqual(['REJECTED', 'rejected_by_approver']);
+        expect(await postingKind(`release:${w.id}`)).toBe('release');
+        expect(await userBal(user)).toBe(500n);
+      }
+    }
+    expect([...outcomes].every((s) => s === 'APPROVED' || s === 'REJECTED')).toBe(true);
   });
 
   it('R22 a decision on an unknown or malformed withdrawal id throws a clear error', async () => {

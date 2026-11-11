@@ -80,7 +80,9 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
     async dropFromMempool(txid: string) {
       const hash = txid as Hash;
       await client.dropTransaction({ hash });
-      // anvil answers the same for a hash it does not hold, and leaves a nonce-gap tx in place
+      // anvil answers the same for a hash it does not hold, and leaves a nonce-gap tx in place.
+      // A hash the node never held passes silently on purpose: a caller dropping "every attempt"
+      // includes ones already replaced. This throws only if the transaction is still known after.
       const still = await client.getTransaction({ hash }).catch((error: unknown) => {
         if (error instanceof TransactionNotFoundError) return null;
         throw error;

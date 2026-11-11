@@ -1,8 +1,10 @@
 import type { Coin, InputStore } from '../core/adapter.js';
 import type { Queryable } from './db.js';
 
-// nextSequence, freeCoins and reserveCoins hold row locks until the transaction ends, so call them
-// inside db.begin; seedSequence and putCoins are fine on a pool.
+// reserveCoins is one statement, so it is atomic on a pool as well as in a transaction.
+// nextSequence and freeCoins need db.begin: a sequence number comes back only if the
+// transaction rolls back, and freeCoins' row locks last only as long as the transaction.
+// seedSequence and putCoins are fine on a pool.
 // `holder` is the id of the withdrawal that reserves coins.
 export function pgInputStore(sql: Queryable, holder: string): InputStore {
   return {

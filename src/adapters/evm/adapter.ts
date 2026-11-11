@@ -301,6 +301,9 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
         const to = getAddress(tx.to);
         transfers.push({ txid: tx.hash, index: 0, to, asset: 'native', amount: tx.value });
       }
+      // viem returns tx.to, the log addresses and the decoded args.to in EIP-55 checksummed form,
+      // so they compare equal to AssetIds and addresses elsewhere in the kit.
+      // The size guard matters: an empty address filter would match every contract's logs.
       const logs =
         tokens.size > 0
           ? await client.getContractEvents({

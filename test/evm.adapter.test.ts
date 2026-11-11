@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { hexToBytes } from '@noble/curves/utils.js';
-import { BlockNotFoundError, HttpRequestError } from 'viem';
+import { BlockNotFoundError, HttpRequestError, createPublicClient, http, type Hash } from 'viem';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEvmAdapter } from '../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../src/adapters/evm/devnet.js';
@@ -39,9 +39,15 @@ async function stubNode(chainId: string) {
         res.statusCode = 500;
         return void res.end('upstream says no');
       }
-      if ('status' in reply && reply.status) res.statusCode = reply.status;
+      // `status` steers this server; it is not part of the JSON-RPC body
+      const { status, ...payload } = reply as {
+        status?: number;
+        result?: unknown;
+        error?: unknown;
+      };
+      if (status) res.statusCode = status;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ jsonrpc: '2.0', id, ...reply }));
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, ...payload }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -93,6 +99,30 @@ const receipt = (blockNumber: string) => ({
   logsBloom: '0x' + '00'.repeat(256),
   status: '0x1',
   type: '0x2',
+});
+const BLOCK_HASH = '0x' + '11'.repeat(32);
+const block = (height: string) => ({
+  number: height,
+  hash: BLOCK_HASH,
+  parentHash: '0x' + '00'.repeat(32),
+  nonce: '0x0000000000000000',
+  sha3Uncles: '0x' + '00'.repeat(32),
+  logsBloom: '0x' + '00'.repeat(256),
+  transactionsRoot: '0x' + '00'.repeat(32),
+  stateRoot: '0x' + '00'.repeat(32),
+  receiptsRoot: '0x' + '00'.repeat(32),
+  miner: '0x' + '00'.repeat(20),
+  difficulty: '0x0',
+  totalDifficulty: '0x0',
+  extraData: '0x',
+  size: '0x1',
+  gasLimit: '0x1c9c380',
+  gasUsed: '0x5208',
+  timestamp: '0x1',
+  mixHash: '0x' + '00'.repeat(32),
+  baseFeePerGas: '0x7',
+  uncles: [],
+  transactions: [tx(height)],
 });
 const nodeSays = (message: string): Reply => ({ error: { code: -32003, message } });
 
@@ -178,6 +208,26 @@ describe('EVM adapter against a stub node', () => {
     expect(await adapter.getTxStatus(TXID)).toEqual({ state: 'unknown' });
   });
 
+  it('scanBlock throws when a receipt belongs to a different block than the one scanned', async () => {
+    // control: a receipt from the same block lists the transfer
+    node.play({
+      eth_getBlockByNumber: [{ result: block('0x5') }],
+      eth_getTransactionReceipt: [{ result: receipt('0x5') }],
+    });
+    const scanned = await adapter.scanBlock(5);
+    expect(scanned.transfers).toHaveLength(1);
+    expect(scanned.transfers[0]).toMatchObject({ txid: TXID, index: 0, asset: 'native' });
+
+    // the node answers the receipt from another block: the chain moved under the scan
+    node.play({
+      eth_getBlockByNumber: [{ result: block('0x5') }],
+      eth_getTransactionReceipt: [
+        { result: { ...receipt('0x5'), blockHash: '0x' + '22'.repeat(32) } },
+      ],
+    });
+    await expect(adapter.scanBlock(5)).rejects.toThrow(/block 5 changed in the scan/);
+  });
+
   it('attachSignatures accepts recovery id 0 or 1 only', () => {
     const unsigned: UnsignedTx = {
       body: {
@@ -205,6 +255,7 @@ describe('EVM adapter broadcast against anvil', () => {
   const signer = LocalSigner.random();
   let adapter: ChainAdapter;
   let devnet: Awaited<ReturnType<typeof createEvmDevnet>>;
+  const client = createPublicClient({ transport: http(config.evmRpcUrl), cacheTime: 0 });
 
   beforeAll(async () => {
     devnet = await createEvmDevnet(config.evmRpcUrl);
@@ -278,8 +329,8 @@ describe('EVM adapter broadcast against anvil', () => {
     const from = await wallet();
     const high = {
       gasLimit: '21000',
-      maxFeePerGas: '800000000001',
-      maxPriorityFeePerGas: '1000000001',
+      maxFeePerGas: '1000000000000001', // 10^15 + 1 wei, far above any market fee
+      maxPriorityFeePerGas: '100000000000001', // 10^14 + 1
     };
     const previous = await unsignedTransfer(from, new MemoryInputStore(), { fee: high });
     const replacement = await adapter.buildReplacement(
@@ -289,8 +340,8 @@ describe('EVM adapter broadcast against anvil', () => {
     );
     const fee = {
       gasLimit: '21000',
-      maxFeePerGas: '900000000002',
-      maxPriorityFeePerGas: '1125000002',
+      maxFeePerGas: '1125000000000002', // previous + ceil(previous / 8)
+      maxPriorityFeePerGas: '112500000000002',
     };
     expect(replacement?.fee).toEqual(fee);
     expect(replacement?.unsigned.body).toEqual({
@@ -304,34 +355,75 @@ describe('EVM adapter broadcast against anvil', () => {
     const from = await wallet();
     const low = { gasLimit: '21000', maxFeePerGas: '8', maxPriorityFeePerGas: '1' };
     const previous = await unsignedTransfer(from, new MemoryInputStore(), { fee: low });
-    const market = await adapter.quoteFee(previous.intent);
-    const replacement = await adapter.buildReplacement(
-      previous.intent,
-      previous.reservation,
-      previous,
-    );
-    expect(replacement?.fee).toEqual(market);
+    // The market is a function of the latest block, so compare only reads taken in one block.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const before = await adapter.getTip();
+      const market = await adapter.quoteFee(previous.intent);
+      const replacement = await adapter.buildReplacement(
+        previous.intent,
+        previous.reservation,
+        previous,
+      );
+      const after = await adapter.getTip();
+      if (before.hash !== after.hash) continue; // a block arrived between the reads: read again
+      expect(replacement?.fee).toEqual(market);
+      return;
+    }
+    throw new Error('a block was mined during every attempt');
   });
 
-  it('scanBlock skips reverted and zero-value transactions, and throws above the tip', async () => {
-    const token = await devnet.deployTestToken();
-    const [a, b] = [await wallet(), await wallet()];
-    await devnet.fund(a.address, 'native', 10n ** 18n);
-    await devnet.fund(b.address, 'native', 10n ** 18n);
+  it('scanBlock lists a value transfer and the configured token, and skips the rest', async () => {
+    const [token, other] = [await devnet.deployTestToken(), await devnet.deployTestToken()];
+    // `scanner` knows one token; `builder` knows both, to build a transfer of the other
+    const scanner = await createEvmAdapter({ rpcUrl: config.evmRpcUrl, tokens: [token] });
+    const builder = await createEvmAdapter({ rpcUrl: config.evmRpcUrl, tokens: [token, other] });
+    const [a, b, c, d] = [await wallet(), await wallet(), await wallet(), await wallet()];
+    for (const w of [a, b, c, d]) await devnet.fund(w.address, 'native', 10n ** 18n);
+    await devnet.fund(c.address, token, 100n);
+    await devnet.fund(c.address, other, 100n);
+    const recipient = (await wallet()).address;
+
     // value sent to a contract with only the intrinsic 21000 gas runs out of gas and reverts
     const reverted = await signedTransfer(a, new MemoryInputStore(), { to: token });
     const zero = await signedTransfer(b, new MemoryInputStore(), { amount: 0n });
-    expect(await adapter.broadcast(reverted)).toEqual({ outcome: 'accepted' });
-    expect(await adapter.broadcast(zero)).toEqual({ outcome: 'accepted' });
+    const value = await signedTransfer(d, new MemoryInputStore(), { to: recipient, amount: 7n });
+    const cStore = new MemoryInputStore(); // one store: the two token transfers get nonces n, n+1
+    const tokenTransfer = async (asset: string) => {
+      const intent = { from: c.address, to: recipient, asset, amount: 5n };
+      const fee = await builder.quoteFee(intent);
+      await builder.syncInputs(cStore, c.address);
+      const reservation = await builder.reserveInputs(cStore, intent, fee);
+      const unsigned = await builder.buildTransfer(intent, reservation, fee);
+      const sig = await signer.sign(c.keyId, 'secp256k1', hexToBytes(unsigned.signingPayloads[0]!));
+      return builder.attachSignatures(unsigned, [sig]);
+    };
+    const wanted = await tokenTransfer(token);
+    const unwanted = await tokenTransfer(other);
+    for (const t of [reverted, zero, value, wanted, unwanted]) {
+      expect(await adapter.broadcast(t)).toEqual({ outcome: 'accepted' });
+    }
     await devnet.mine(1);
     expect(await adapter.getTxStatus(reverted.txid)).toMatchObject({ succeeded: false });
     expect(await adapter.getTxStatus(zero.txid)).toMatchObject({ succeeded: true });
 
     const tip = await adapter.getTip();
     expect(await adapter.getTxStatus(zero.txid)).toMatchObject({ block: tip });
-    const scanned = (await adapter.scanBlock(tip.height)).transfers.map((t) => t.txid);
-    expect(scanned).not.toContain(reverted.txid);
-    expect(scanned).not.toContain(zero.txid);
+    const { transfers } = await scanner.scanBlock(tip.height);
+    const ids = transfers.map((t) => t.txid);
+    expect(ids).not.toContain(reverted.txid);
+    expect(ids).not.toContain(zero.txid);
+    expect(ids).not.toContain(unwanted.txid);
+    expect(transfers.filter((t) => t.asset === other)).toEqual([]);
+    // positive controls
+    expect(transfers.filter((t) => t.txid === value.txid)).toEqual([
+      { txid: value.txid, index: 0, to: recipient, asset: 'native', amount: 7n },
+    ]);
+    const logIndex = (await client.getTransactionReceipt({ hash: wanted.txid as Hash })).logs[0]
+      ?.logIndex;
+    expect(logIndex).toBeDefined();
+    expect(transfers.filter((t) => t.txid === wanted.txid)).toEqual([
+      { txid: wanted.txid, index: logIndex, to: recipient, asset: token, amount: 5n },
+    ]);
     await expect(adapter.scanBlock(tip.height + 1)).rejects.toThrow(BlockNotFoundError);
   });
 });

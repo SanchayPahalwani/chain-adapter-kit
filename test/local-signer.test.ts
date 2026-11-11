@@ -18,6 +18,16 @@ describe('LocalSigner', () => {
     );
   });
 
+  it("copies the seed: mutating the caller's array afterwards changes nothing", async () => {
+    for (const make of [(b: Uint8Array) => Uint8Array.from(b), (b: Uint8Array) => Buffer.from(b)]) {
+      const seed = make(crypto.getRandomValues(new Uint8Array(32)));
+      const signer = new LocalSigner(seed);
+      const before = await signer.publicKey('k', 'secp256k1');
+      seed.fill(0);
+      expect(await signer.publicKey('k', 'secp256k1')).toEqual(before);
+    }
+  });
+
   it('secp256k1: 33-byte compressed key, 65-byte signature that recovers to it', async () => {
     const signer = LocalSigner.random();
     const publicKey = await signer.publicKey('k', 'secp256k1');

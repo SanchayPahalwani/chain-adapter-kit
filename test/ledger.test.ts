@@ -202,7 +202,8 @@ describe('ledger', () => {
   it('L5f lockAccount holds the row lock until its transaction ends', async () => {
     const a = asset('l5f');
     const user = acct.user('u', a);
-    await t.db.begin((tx) => post(tx, 'l5f:fund', 'fund', a, fund('u', a, 10n))); // the row exists and is committed
+    // the row exists and is committed
+    await t.db.begin((tx) => post(tx, 'l5f:fund', 'fund', a, fund('u', a, 10n)));
     let locked!: () => void;
     const aReady = new Promise<void>((r) => (locked = r));
     let release!: () => void;
@@ -216,6 +217,7 @@ describe('ledger', () => {
 
     let bPid: number | undefined;
     let postDone = false;
+    let posterFailed = false;
     const poster = t.db.begin(async (tx) => {
       const [p] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
       bPid = p?.pid;
@@ -224,11 +226,15 @@ describe('ledger', () => {
     const posterDone = poster.then(
       (ok) => ((postDone = true), ok),
       (e: unknown) => {
+        posterFailed = true;
         release(); // do not leave the holder open if the poster failed
         throw e;
       },
     );
+    // awaited below; this keeps an early failure from going unhandled meanwhile
+    posterDone.catch(() => undefined);
     for (let i = 0; ; i++) {
+      if (posterFailed) await posterDone; // fails the test now with the poster's own error
       if (bPid !== undefined) {
         const waiting = await t.db`select 1 from pg_locks where not granted and pid = ${bPid}`;
         if (waiting.length > 0) break;
@@ -278,7 +284,8 @@ describe('ledger', () => {
     expect(await balance(t.db, acct.custody(a))).toBe(500n - 150n + 6n);
     const rows = await t.db<{ name: string; balance: bigint; journal: bigint }[]>`
       select a.name, a.balance,
-             coalesce(sum(case when e.side = a.normal_side then e.amount else -e.amount end), 0) as journal
+             coalesce(sum(case when e.side = a.normal_side then e.amount else -e.amount end), 0)
+               as journal
       from ledger_accounts a left join ledger_entries e on e.account = a.name
       group by a.name, a.balance`;
     expect(rows.length).toBeGreaterThanOrEqual(5);

@@ -31,11 +31,13 @@ export class MemoryInputStore implements InputStore {
 
   async reserveCoins(ids: string[]): Promise<void> {
     // check all first so a failed call reserves nothing
-    for (const id of ids) {
+    if (new Set(ids).size !== ids.length) throw new Error('duplicate coin id in reservation');
+    const entries = ids.map((id) => {
       const entry = this.coins.get(id);
       if (!entry) throw new Error(`coin ${id} does not exist`);
       if (entry.reserved) throw new Error(`coin ${id} is already reserved`);
-    }
-    for (const id of ids) this.coins.get(id)!.reserved = true;
+      return entry;
+    });
+    for (const entry of entries) entry.reserved = true;
   }
 }

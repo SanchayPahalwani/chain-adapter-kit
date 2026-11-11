@@ -13,7 +13,9 @@ describe('LocalSigner', () => {
     const again = LocalSigner.fromHex(a.seedHex);
     expect(await again.publicKey('k', 'secp256k1')).toEqual(await a.publicKey('k', 'secp256k1'));
     expect(await a.publicKey('k1', 'secp256k1')).not.toEqual(await a.publicKey('k2', 'secp256k1'));
-    expect(a.seedHex).not.toEqual(LocalSigner.random().seedHex);
+    expect(await LocalSigner.random().publicKey('k', 'secp256k1')).not.toEqual(
+      await LocalSigner.random().publicKey('k', 'secp256k1'),
+    );
   });
 
   it('secp256k1: 33-byte compressed key, 65-byte signature that recovers to it', async () => {
@@ -27,10 +29,14 @@ describe('LocalSigner', () => {
     const recovered = new Uint8Array([sig[64]!, ...sig.subarray(0, 64)]);
     const recoveredKey = secp256k1.recoverPublicKey(recovered, digest, { prehash: false });
     expect(equalBytes(recoveredKey, publicKey)).toBe(true);
+    // independent of the rotation above: r || s alone must verify (this also pins low-S)
+    expect(secp256k1.verify(sig.subarray(0, 64), digest, publicKey, { prehash: false })).toBe(true);
   });
 
   it('secp256k1: rejects a payload that is not 32 bytes', async () => {
-    await expect(LocalSigner.random().sign('k', 'secp256k1', new Uint8Array(31))).rejects.toThrow();
+    await expect(LocalSigner.random().sign('k', 'secp256k1', new Uint8Array(31))).rejects.toThrow(
+      /32-byte digest/,
+    );
   });
 
   it('ed25519: 32-byte key, 64-byte signature that verifies over the message', async () => {

@@ -16,9 +16,11 @@ export interface TransferIntent {
 
 export interface UnsignedTx {
   body: Json; // adapter-specific; the pipeline stores it and never looks inside
-  signingPayloads: string[]; // hex; what the signer signs, in order
+  // Lower-case hex, no 0x prefix. One entry per signature the signer must produce, in order.
+  signingPayloads: string[];
 }
 
+// `raw` and `txid` are in the chain's own conventional encoding and are opaque to the pipeline.
 export interface SignedTx {
   txid: string; // computed locally
   raw: string;
@@ -106,8 +108,8 @@ export interface ChainAdapter {
    * Returns a transaction that cannot confirm together with the one it replaces: same
    * nonce on EVM, same inputs on Bitcoin. On a chain where a signed transaction expires
    * instead, returns `null` until the previous one can no longer be included, and only
-   * then a fresh one. The pipeline only relies on "at most one attempt of a withdrawal
-   * can ever confirm".
+   * then a fresh one. The pipeline does not know which rule applies. It only relies on
+   * "at most one attempt of a withdrawal can ever confirm".
    */
   buildReplacement(
     intent: TransferIntent,
@@ -130,6 +132,9 @@ export interface ChainAdapter {
   getTxStatus(txid: string): Promise<TxStatus>;
 
   // deposits
-  /** Returns the parent hash, so the scanner can see a reorg as a broken link between consecutive heights. */
+  /**
+   * Returns the parent hash, so the scanner can see a reorg as a broken link between
+   * consecutive heights.
+   */
   scanBlock(height: number): Promise<ScannedBlock>;
 }

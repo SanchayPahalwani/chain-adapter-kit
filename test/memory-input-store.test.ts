@@ -24,7 +24,7 @@ describe('MemoryInputStore', () => {
   });
 
   it('nextSequence throws for a key that was never seeded', async () => {
-    await expect(new MemoryInputStore().nextSequence('missing')).rejects.toThrow();
+    await expect(new MemoryInputStore().nextSequence('missing')).rejects.toThrow(/never seeded/);
   });
 
   it('putCoins inserts once; freeCoins excludes reserved coins', async () => {
@@ -38,8 +38,22 @@ describe('MemoryInputStore', () => {
   it('reserveCoins throws if a coin is missing or already reserved', async () => {
     const store = new MemoryInputStore();
     await store.putCoins([coin('a')]);
-    await expect(store.reserveCoins(['nope'])).rejects.toThrow();
+    await expect(store.reserveCoins(['nope'])).rejects.toThrow(/does not exist/);
     await store.reserveCoins(['a']);
-    await expect(store.reserveCoins(['a'])).rejects.toThrow();
+    await expect(store.reserveCoins(['a'])).rejects.toThrow(/already reserved/);
+  });
+
+  it('a failed reservation reserves nothing', async () => {
+    const store = new MemoryInputStore();
+    await store.putCoins([coin('a'), coin('b')]);
+    await expect(store.reserveCoins(['a', 'nope'])).rejects.toThrow(/does not exist/);
+    expect((await store.freeCoins('alice')).map((c) => c.id)).toEqual(['a', 'b']);
+  });
+
+  it('reserveCoins rejects a duplicate id and leaves the coin free', async () => {
+    const store = new MemoryInputStore();
+    await store.putCoins([coin('a')]);
+    await expect(store.reserveCoins(['a', 'a'])).rejects.toThrow(/duplicate/);
+    expect((await store.freeCoins('alice')).map((c) => c.id)).toEqual(['a']);
   });
 });

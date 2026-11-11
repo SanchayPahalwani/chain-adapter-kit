@@ -26,17 +26,23 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
   const account = privateKeyToAccount(DEV_ACCOUNT_KEY);
   const client = createTestClient({
     mode: 'anvil',
-    chain: foundry, // chain id 31337; viem refuses to send if the node reports another
+    chain: foundry, // chain id 31337
     account,
     transport: http(rpcUrl),
     cacheTime: 0,
   })
     .extend(publicActions)
     .extend(walletActions);
-  await client.getChainId(); // fail here, not mid-test, if the node is down
+  // this helper holds a key, so it refuses anything but a local anvil
+  const chainId = await client.getChainId();
+  if (chainId !== foundry.id) {
+    throw new Error(`refusing chain id ${chainId}: only a local anvil (${foundry.id}) is allowed`);
+  }
 
-  // anvil runs with --no-mining, so every send is followed by a block; the next nonce is
-  // re-read from the node each time rather than tracked here.
+  // The nonce is read from the node before every send, with the `pending` tag: under
+  // --no-mining a send from this account can still be in the pool (one an interrupted
+  // earlier run left behind), and `latest` would hand out its nonce again. Passing it
+  // explicitly also keeps viem from choosing a source of its own.
   const nextNonce = () =>
     client.getTransactionCount({ address: account.address, blockTag: 'pending' });
   async function mineAndCheck(hash: Hex) {
@@ -47,6 +53,8 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
   }
 
   return {
+    // Not safe to call concurrently: two token mints would read the same nonce, and two
+    // native top-ups would both add to the same starting balance.
     async fund(address: string, asset: AssetId, amount: bigint) {
       if (asset === 'native') {
         const current = await client.getBalance({ address: address as Address });

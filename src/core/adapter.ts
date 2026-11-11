@@ -121,7 +121,8 @@ export interface ChainAdapter {
   /**
    * Safe to repeat with the same bytes: sending them again never causes a second
    * transfer. If the node already has the transaction, in the mempool or in a block,
-   * the result is `already_known`, not an error.
+   * the result is `already_known`, not an error. `rejected` is not final; the caller keeps
+   * tracking the attempt.
    */
   broadcast(tx: SignedTx): Promise<BroadcastResult>;
   /**

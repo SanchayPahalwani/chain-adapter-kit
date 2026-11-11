@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { bytesToHex, hexToBytes } from '@noble/curves/utils.js';
+import { hexToBytes } from '@noble/curves/utils.js';
 import { beforeAll, describe, expect, it } from 'vitest';
 import type {
   AssetId,
@@ -17,14 +17,14 @@ interface Wallet {
   address: string;
 }
 
-const fromHex = (hex: string) => hexToBytes(hex.replace(/^0x/, ''));
-
 /**
- * The checks every adapter must pass. The harness is built once, in beforeAll, because
- * building it talks to the devnet. The describe title is fixed for the same reason: the
- * harness name is not known while vitest collects the tests.
+ * The checks every adapter must pass, under `describe(name)`. The harness is built once,
+ * in beforeAll, because building it talks to the devnet.
  */
-export function runConformanceSuite(makeHarness: () => Promise<ConformanceHarness>): void {
+export function runConformanceSuite(
+  name: string,
+  makeHarness: () => Promise<ConformanceHarness>,
+): void {
   let h: ConformanceHarness;
   const native = (): AssetId => h.assets[0]!;
 
@@ -56,10 +56,10 @@ export function runConformanceSuite(makeHarness: () => Promise<ConformanceHarnes
     const unsigned: UnsignedTx = await h.adapter.buildTransfer(intent, reservation, fee);
     const signatures: Uint8Array[] = [];
     for (const payload of unsigned.signingPayloads) {
-      signatures.push(await h.signer.sign(from.keyId, h.adapter.curve, fromHex(payload)));
+      signatures.push(await h.signer.sign(from.keyId, h.adapter.curve, hexToBytes(payload)));
     }
     const signed: SignedTx = h.adapter.attachSignatures(unsigned, signatures);
-    return { signed, unsigned, fee, reservation, intent };
+    return { signed, unsigned, signatures, fee, reservation, intent };
   }
 
   // One transfer of one unit from a fresh funded wallet to a fresh wallet.
@@ -76,9 +76,12 @@ export function runConformanceSuite(makeHarness: () => Promise<ConformanceHarnes
     return status;
   }
 
-  describe('conformance', () => {
+  describe(name, () => {
     beforeAll(async () => {
       h = await makeHarness();
+      // so the per-asset and per-address loops cannot pass by checking nothing
+      expect(h.assets[0]).toBe('native');
+      expect(h.invalidAddresses.length).toBeGreaterThan(0);
       await h.devnet.mine(1); // clear anything a previous run left in the mempool
     });
 
@@ -112,11 +115,8 @@ export function runConformanceSuite(makeHarness: () => Promise<ConformanceHarnes
     });
 
     it('C5 attachSignatures is pure', async () => {
-      const { unsigned, from } = await transfer(native());
-      const signatures: Uint8Array[] = [];
-      for (const payload of unsigned.signingPayloads) {
-        signatures.push(await h.signer.sign(from.keyId, h.adapter.curve, fromHex(payload)));
-      }
+      const { unsigned, signatures } = await transfer(native());
+      for (const payload of unsigned.signingPayloads) expect(payload).toMatch(/^([0-9a-f]{2})+$/);
       const a = h.adapter.attachSignatures(unsigned, signatures);
       const b = h.adapter.attachSignatures(unsigned, signatures);
       expect(b).toEqual(a);
@@ -163,10 +163,7 @@ export function runConformanceSuite(makeHarness: () => Promise<ConformanceHarnes
 
     it('C10 status goes unknown -> pending -> confirmed with growing confirmations', async () => {
       const { signed } = await transfer(native());
-      // a random id in the same format as a real one (same prefix, same length)
-      const prefix = signed.txid.startsWith('0x') ? '0x' : '';
-      const random = prefix + bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
-      expect(await h.adapter.getTxStatus(random)).toEqual({ state: 'unknown' });
+      expect(await h.adapter.getTxStatus(h.unknownTxid())).toEqual({ state: 'unknown' });
       expect(await h.adapter.getTxStatus(signed.txid)).toEqual({ state: 'unknown' });
 
       await h.adapter.broadcast(signed);

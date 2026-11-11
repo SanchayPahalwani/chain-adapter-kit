@@ -31,7 +31,7 @@ import type {
 export interface EvmAdapterOptions {
   rpcUrl: string;
   finalityDepth?: number; // default 3
-  tokens?: string[]; // ERC-20 contract addresses; each one is also its AssetId
+  tokens?: string[]; // ERC-20 contract addresses
 }
 
 const LOCAL_CHAIN_ID = 31337;
@@ -65,20 +65,19 @@ function toSerializable(body: Body): TransactionSerializableEIP1559 {
   };
 }
 
-// The node's own error text. Anything that is not the node answering (a transport
-// failure, say) is rethrown: it says nothing about the transaction.
-function nodeMessage(error: unknown): string {
+// The node's own error text. Anything that is not the node answering (an HTTP error, a
+// timeout, a closed socket) is rethrown: it says nothing about the transaction.
+function nodeAnswer(error: unknown): string {
   const rpc = error instanceof BaseError ? error.walk((e) => e instanceof RpcRequestError) : null;
   if (!(rpc instanceof RpcRequestError)) throw error;
   return rpc.details;
 }
 
-// viem throws for an unknown hash; turn that into null.
-function orNull(...notFound: (new (...args: never[]) => Error)[]) {
-  return (error: unknown) => {
-    if (notFound.some((type) => error instanceof type)) return null;
-    throw error;
-  };
+// For an unknown hash the node answers null and viem throws a typed error; turn it back into null.
+function notFound(error: unknown): null {
+  if (error instanceof TransactionNotFoundError) return null;
+  if (error instanceof TransactionReceiptNotFoundError) return null;
+  throw error;
 }
 
 export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAdapter> {
@@ -91,6 +90,7 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       `refusing chain id ${chainId}: only a local anvil (${LOCAL_CHAIN_ID}) is allowed`,
     );
   }
+  // A token's AssetId is its checksummed contract address.
   const tokens = new Set((opts.tokens ?? []).map((t) => getAddress(t)));
 
   function token(asset: AssetId): Address {
@@ -111,22 +111,30 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
     return { to: token(intent.asset), value: 0n, data };
   }
 
+  // In the mempool or in a block.
+  async function nodeHas(txid: string): Promise<boolean> {
+    const hash = txid as Hash;
+    if (await client.getTransactionReceipt({ hash }).catch(notFound)) return true;
+    return (await client.getTransaction({ hash }).catch(notFound)) !== null;
+  }
+
   async function getTxStatus(txid: string): Promise<TxStatus> {
     const hash = txid as Hash;
-    const receipt = await client
-      .getTransactionReceipt({ hash })
-      .catch(orNull(TransactionReceiptNotFoundError));
+    const receipt = await client.getTransactionReceipt({ hash }).catch(notFound);
     if (receipt) {
       const tip = await client.getBlockNumber();
-      return {
-        state: 'confirmed',
-        block: { height: Number(receipt.blockNumber), hash: receipt.blockHash },
-        confirmations: Number(tip - receipt.blockNumber + 1n),
-        succeeded: receipt.status === 'success',
-        feePaid: receipt.gasUsed * receipt.effectiveGasPrice,
-      };
+      // a tip below the receipt's block means a rollback between the two reads: not confirmed
+      if (tip >= receipt.blockNumber) {
+        return {
+          state: 'confirmed',
+          block: { height: Number(receipt.blockNumber), hash: receipt.blockHash },
+          confirmations: Number(tip - receipt.blockNumber + 1n),
+          succeeded: receipt.status === 'success',
+          feePaid: receipt.gasUsed * receipt.effectiveGasPrice,
+        };
+      }
     }
-    const pending = await client.getTransaction({ hash }).catch(orNull(TransactionNotFoundError));
+    const pending = await client.getTransaction({ hash }).catch(notFound);
     return pending ? { state: 'pending' } : { state: 'unknown' };
   }
 
@@ -167,6 +175,7 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       const { maxFeePerGas, maxPriorityFeePerGas } = await client.estimateFeesPerGas();
       let gasLimit = 21000n;
       if (intent.asset !== 'native') {
+        // the estimate runs the call, so it reverts if the sender does not hold the tokens
         const estimate = await client.estimateGas({
           account: intent.from as Address,
           ...call(intent),
@@ -193,7 +202,8 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       return { nonce: nonce.toString() };
     },
 
-    buildTransfer(intent: TransferIntent, reservation: Json, fee: Json): Promise<UnsignedTx> {
+    // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
+    async buildTransfer(intent: TransferIntent, reservation: Json, fee: Json): Promise<UnsignedTx> {
       const { nonce } = reservation as Reservation;
       const { gasLimit, maxFeePerGas, maxPriorityFeePerGas } = fee as Fee;
       const { to, value, data } = call(intent);
@@ -208,7 +218,7 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
         maxPriorityFeePerGas,
       };
       const digest = keccak256(serializeTransaction(toSerializable(body)));
-      return Promise.resolve({ body, signingPayloads: [digest] });
+      return { body, signingPayloads: [digest.slice(2)] }; // bare lower-case hex
     },
 
     attachSignatures(unsigned: UnsignedTx, signatures: Uint8Array[]) {
@@ -216,10 +226,13 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       if (!sig || rest.length > 0)
         throw new Error(`expected 1 signature, got ${signatures.length}`);
       if (sig.length !== 65) throw new Error(`expected a 65-byte signature, got ${sig.length}`);
+      // viem reads any non-zero value as 1, so a 27/28 signer would sign as another address
+      const yParity = sig[64]!;
+      if (yParity > 1) throw new Error(`recovery id must be 0 or 1, got ${yParity}`);
       const raw = serializeTransaction(toSerializable(unsigned.body as Body), {
         r: bytesToHex(sig.subarray(0, 32)),
         s: bytesToHex(sig.subarray(32, 64)),
-        yParity: sig[64]!,
+        yParity,
       });
       return { txid: keccak256(raw), raw };
     },
@@ -229,19 +242,20 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
     },
 
     async broadcast({ txid, raw }) {
-      if ((await getTxStatus(txid)).state !== 'unknown') return { outcome: 'already_known' };
+      if (await nodeHas(txid)) return { outcome: 'already_known' };
+      let hash: Hash;
       try {
-        await client.sendRawTransaction({ serializedTransaction: raw as Hex });
-        return { outcome: 'accepted' };
+        hash = await client.sendRawTransaction({ serializedTransaction: raw as Hex });
       } catch (error) {
-        const reason = nodeMessage(error);
-        if (reason === 'transaction already imported') return { outcome: 'already_known' };
-        // also what a different transaction with a used nonce gets: only our txid tells them apart
-        if (reason === 'nonce too low' && (await getTxStatus(txid)).state !== 'unknown') {
-          return { outcome: 'already_known' };
-        }
-        return { outcome: 'rejected', reason };
+        const reason = nodeAnswer(error);
+        // The text does not say whether these bytes are the ones the node has ("nonce too low"
+        // is also what another transaction with a used nonce gets); the txid lookup does.
+        return (await nodeHas(txid))
+          ? { outcome: 'already_known' }
+          : { outcome: 'rejected', reason };
       }
+      if (hash !== txid) throw new Error(`node reports hash ${hash} for local txid ${txid}`);
+      return { outcome: 'accepted' };
     },
 
     getTxStatus,

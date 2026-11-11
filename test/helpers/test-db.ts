@@ -7,25 +7,20 @@ export async function createTestDb(): Promise<{ db: Db; schema: string; close():
   const schema = `t_${randomBytes(6).toString('hex')}`;
   const admin = connect(config.databaseUrl);
   const db = connect(config.databaseUrl, schema);
+  async function drop(): Promise<void> {
+    try {
+      await db.end({ timeout: 5 }); // a test that timed out may leave a transaction open
+      await admin`drop schema if exists ${admin(schema)} cascade`;
+    } finally {
+      await admin.end();
+    }
+  }
   try {
-    await admin.unsafe(`create schema ${schema}`);
+    await admin`create schema ${admin(schema)}`;
     await migrate(db);
   } catch (e) {
-    await db.end();
-    await admin.unsafe(`drop schema if exists ${schema} cascade`);
-    await admin.end();
+    await drop().catch(() => undefined);
     throw e;
   }
-  return {
-    db,
-    schema,
-    async close() {
-      try {
-        await db.end();
-        await admin.unsafe(`drop schema if exists ${schema} cascade`);
-      } finally {
-        await admin.end();
-      }
-    },
-  };
+  return { db, schema, close: drop };
 }

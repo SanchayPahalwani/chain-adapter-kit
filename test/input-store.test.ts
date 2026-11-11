@@ -1,5 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { migrate } from '../src/pipeline/db.js';
+import { config } from '../src/config.js';
+import { connect, migrate } from '../src/pipeline/db.js';
 import { pgInputStore } from '../src/pipeline/input-store.js';
 import { createTestDb } from './helpers/test-db.js';
 
@@ -35,16 +37,18 @@ describe('pg input store', () => {
 
   it('I3 nextSequence: 20 concurrent transactions get 20 distinct consecutive values', async () => {
     await pgInputStore(t.db, holder).seedSequence('i3', 100n);
-    const taken = await Promise.all(
+    const results = await Promise.all(
       Array.from({ length: 20 }, () =>
         t.db.begin(async (tx) => {
           const v = await pgInputStore(tx, holder).nextSequence('i3');
+          const [p] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
           await new Promise((r) => setTimeout(r, 20)); // hold the row lock so takers really overlap
-          return v;
+          return { v, pid: p?.pid };
         }),
       ),
     );
-    expect([...taken].sort((a, b) => (a < b ? -1 : 1))).toEqual(
+    expect(new Set(results.map((r) => r.pid)).size).toBeGreaterThan(1);
+    expect(results.map((r) => r.v).sort((a, b) => (a < b ? -1 : 1))).toEqual(
       Array.from({ length: 20 }, (_, i) => 100n + BigInt(i)),
     );
     const [row] = await t.db`select next from chain_sequences where key = 'i3'`;
@@ -53,13 +57,35 @@ describe('pg input store', () => {
 
   it('I4 a rolled-back transaction returns its sequence value', async () => {
     await pgInputStore(t.db, holder).seedSequence('i4', 5n);
-    await expect(
-      t.db.begin(async (tx) => {
+    let aTookIt!: () => void;
+    const aReady = new Promise<void>((r) => (aTookIt = r));
+    let abortA!: () => void;
+    const aGate = new Promise<void>((r) => (abortA = r));
+
+    const a = t.db
+      .begin(async (tx) => {
         expect(await pgInputStore(tx, holder).nextSequence('i4')).toBe(5n);
+        aTookIt();
+        await aGate;
         throw new Error('abort');
-      }),
-    ).rejects.toThrow('abort');
-    expect(await pgInputStore(t.db, holder).nextSequence('i4')).toBe(5n);
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    await Promise.race([aReady, a]);
+
+    // B asks while A holds the row lock
+    const b = t.db.begin((tx) => pgInputStore(tx, holder).nextSequence('i4'));
+    for (let i = 0; ; i++) {
+      const waiting = await t.db`select 1 from pg_locks where not granted`;
+      if (waiting.length > 0) break;
+      if (i > 200) throw new Error('B never blocked behind A');
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    abortA();
+    expect(((await a) as Error).message).toBe('abort');
+    expect(await b).toBe(5n);
     await expect(pgInputStore(t.db, holder).nextSequence('never')).rejects.toThrow(/never seeded/);
   });
 
@@ -92,7 +118,7 @@ describe('pg input store', () => {
       await aGate; // A's transaction stays open until B has finished
       return mine;
     });
-    await aReady;
+    await Promise.race([aReady, a]); // if A fails before the gate, surface its error now
     const seenByB = await t.db.begin((tx) => pgInputStore(tx, holder).freeCoins('i6'));
     releaseA();
     const seenByA = await a;
@@ -113,10 +139,52 @@ describe('pg input store', () => {
     const [row] = await t.db`select reserved_by from chain_coins where id = 'r1'`;
     expect(row?.reserved_by).toBe(holder);
     await expect(store.reserveCoins(['nope'])).rejects.toThrow();
-    // the pipeline calls this inside a transaction; the failure rolls back with it, so r2 stays free
-    await expect(
-      t.db.begin((tx) => pgInputStore(tx, 'other').reserveCoins(['r1', 'r2'])),
-    ).rejects.toThrow(/r1/);
+    await expect(pgInputStore(t.db, 'other').reserveCoins(['r1', 'r2'])).rejects.toThrow(/r1/);
     expect((await store.freeCoins('i7')).map((c) => c.id)).toEqual(['r2']);
+  });
+
+  it('I7b a failed reserveCoins reserves nothing, on a pool or in a caught transaction', async () => {
+    const store = pgInputStore(t.db, holder);
+    const free = async () => (await store.freeCoins('i7b')).map((c) => c.id).sort();
+    await store.putCoins(
+      ['d1', 'd2', 'd3'].map((id) => ({ id, owner: 'i7b', amount: 1n, data: {} })),
+    );
+    await store.reserveCoins(['d3']);
+
+    // (a) bare pool: d1 is free, d3 is taken
+    await expect(store.reserveCoins(['d1', 'd3'])).rejects.toThrow();
+    expect(await free()).toEqual(['d1', 'd2']);
+
+    // (b) the caller catches the error and commits anyway
+    await t.db.begin(async (tx) => {
+      await expect(pgInputStore(tx, holder).reserveCoins(['d2', 'd3'])).rejects.toThrow();
+    });
+    expect(await free()).toEqual(['d1', 'd2']);
+
+    // (c) duplicate ids
+    await expect(store.reserveCoins(['d1', 'd1'])).rejects.toThrow(/d1/);
+    expect(await free()).toEqual(['d1', 'd2']);
+  });
+
+  it('I8 two concurrent migrate calls on one fresh schema both succeed', async () => {
+    const schema = `t_${randomBytes(6).toString('hex')}`;
+    const admin = connect(config.databaseUrl);
+    const p1 = connect(config.databaseUrl, schema);
+    const p2 = connect(config.databaseUrl, schema);
+    try {
+      await admin`create schema ${admin(schema)}`;
+      await Promise.all([migrate(p1), migrate(p2)]);
+      const tables = await admin`
+        select table_name from information_schema.tables
+        where table_schema = ${schema} and table_name in ('withdrawals', 'schema_migrations')`;
+      expect(tables.length).toBe(2);
+      const applied = await p1`select name from schema_migrations`;
+      expect(applied.length).toBe(1);
+    } finally {
+      await p1.end();
+      await p2.end();
+      await admin`drop schema if exists ${admin(schema)} cascade`;
+      await admin.end();
+    }
   });
 });

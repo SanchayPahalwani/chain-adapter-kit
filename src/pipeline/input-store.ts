@@ -1,6 +1,8 @@
 import type { Coin, InputStore } from '../core/adapter.js';
 import type { Queryable } from './db.js';
 
+// nextSequence, freeCoins and reserveCoins hold row locks until the transaction ends, so call them
+// inside db.begin; seedSequence and putCoins are fine on a pool.
 // `holder` is the id of the withdrawal that reserves coins.
 export function pgInputStore(sql: Queryable, holder: string): InputStore {
   return {
@@ -36,12 +38,21 @@ export function pgInputStore(sql: Queryable, holder: string): InputStore {
         for update skip locked`;
     },
 
+    // One statement: the rows are locked first, and nothing is updated unless all ids matched.
+    // Duplicate ids collapse to one row, so the count check rejects them too.
     async reserveCoins(ids) {
       const rows = await sql`
+        with wanted as (
+          select id from chain_coins
+          where id = any(${ids}) and reserved_by is null
+          for update)
         update chain_coins set reserved_by = ${holder}
-        where id = any(${ids}) and reserved_by is null`;
+        where id in (select id from wanted)
+          and (select count(*) from wanted) = ${ids.length}`;
       if (rows.count !== ids.length) {
-        throw new Error(`could not reserve all of ${ids.join(', ')}: missing or already reserved`);
+        throw new Error(
+          `could not reserve all of ${ids.join(', ')}: missing, duplicate or already reserved`,
+        );
       }
     },
   };

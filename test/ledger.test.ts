@@ -8,7 +8,7 @@ import {
   post,
   type Line,
 } from '../src/pipeline/ledger.js';
-import { createTestDb } from './helpers/test-db.js';
+import { createTestDb } from '../scripts/lib/sandbox.js';
 
 let t: Awaited<ReturnType<typeof createTestDb>>;
 beforeAll(async () => {

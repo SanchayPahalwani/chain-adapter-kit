@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { config } from '../src/config.js';
 import { connect, migrate } from '../src/pipeline/db.js';
 import { pgInputStore } from '../src/pipeline/input-store.js';
-import { createTestDb } from './helpers/test-db.js';
+import { createTestDb } from '../scripts/lib/sandbox.js';
 
 let t: Awaited<ReturnType<typeof createTestDb>>;
 beforeAll(async () => {

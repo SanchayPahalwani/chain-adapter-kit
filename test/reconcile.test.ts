@@ -9,7 +9,7 @@ import {
 } from '../src/pipeline/reconcile.js';
 import { getWithdrawal, type Withdrawal } from '../src/pipeline/requests.js';
 import { runOnce, type ChainRuntime } from '../src/pipeline/worker.js';
-import { makeEvmEnv } from './helpers/evm-env.js';
+import { makeEvmEnv } from '../scripts/lib/evm-env.js';
 import {
   attemptsOf,
   drive,

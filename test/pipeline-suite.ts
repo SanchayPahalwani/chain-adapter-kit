@@ -1,59 +1,29 @@
-import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AssetId, ChainAdapter, SignedTx } from '../src/core/adapter.js';
-import { LocalSigner } from '../src/core/local-signer.js';
-import { startMiner, type Devnet } from '../src/conformance/harness.js';
+import type { ChainAdapter, SignedTx } from '../src/core/adapter.js';
+import { startMiner } from '../src/conformance/harness.js';
 import { noCrash } from '../src/pipeline/crash.js';
 import type { Db } from '../src/pipeline/db.js';
-import { acct, balance, ledgerAsset, post } from '../src/pipeline/ledger.js';
-import type { AssetPolicy } from '../src/pipeline/policy.js';
-import {
-  allowAddress,
-  getWithdrawal,
-  submitWithdrawal,
-  type RequestDeps,
-  type Withdrawal,
-  type WithdrawalState,
-} from '../src/pipeline/requests.js';
+import { acct, balance, ledgerAsset } from '../src/pipeline/ledger.js';
+import { getWithdrawal, type Withdrawal, type WithdrawalState } from '../src/pipeline/requests.js';
 import { handlers, LostRace } from '../src/pipeline/steps.js';
 import {
   claim,
-  hotWallet,
   runOnce,
   runWorker,
-  type ChainRuntime,
   type Timings,
   type WorkerDeps,
 } from '../src/pipeline/worker.js';
-import { createTestDb } from './helpers/test-db.js';
+import type { PipelineEnv } from '../scripts/lib/env.js';
+import {
+  gasFloat,
+  openSandbox,
+  type Sandbox,
+  type SandboxOptions,
+} from '../scripts/lib/sandbox.js';
 
-export interface PipelineEnv {
-  chain: string;
-  adapter: ChainAdapter;
-  devnet: Devnet;
-  assets: AssetId[]; // 'native' first
-  unit(asset: AssetId): bigint;
-  freshAddress(): Promise<string>; // a valid address nobody else uses
-  // raise the fee level and keep it raised across blocks:
-  // transactions quoted before this no longer confirm, later quotes do
-  makeStuck(): Promise<void>;
-  // true: a transaction priced below the raised level leaves the pool (is evicted) rather than
-  // waiting in it, so re-sending it is rejected until a replacement gets through
-  stuckEvicts: boolean;
-  clearStuck(): Promise<void>; // back to the normal fee level
-}
+export type { PipelineEnv };
 
-// native the hot wallet holds for fees, booked as the platform's own
-const gasFloat = (env: PipelineEnv) => 100n * env.unit('native');
-const unlimited = 10n ** 40n;
-const policy: AssetPolicy = {
-  perWithdrawalMax: unlimited,
-  rolling24hMax: unlimited,
-  approvalThreshold: unlimited, // never asks for approval
-  approvalsRequired: 1,
-  approvers: ['ops'],
-};
 export const testTimings: Timings = {
   leaseMs: 1000,
   pollMs: 20,
@@ -62,91 +32,26 @@ export const testTimings: Timings = {
   maxAttempts: 5,
 };
 
-/** One test's world: a fresh schema, a fresh hot wallet funded on-chain and in the ledger, one user. */
-export interface Pipeline {
-  db: Db;
+/** One test's world: a sandbox (scripts/lib/sandbox.ts), and deps to run its worker in-process. */
+export interface Pipeline extends Sandbox {
   deps: WorkerDeps;
-  hot: ChainRuntime;
-  userId: string;
-  /** A deposit: the user is owed `amount` and the hot wallet holds it on-chain. */
-  credit(asset: AssetId, amount: bigint): Promise<void>;
-  /** An APPROVED withdrawal to a fresh allowlisted address. */
-  withdraw(asset: AssetId, amount: bigint): Promise<Withdrawal>;
-  close(): Promise<void>;
 }
 
-export interface PipelineOptions {
-  // false: the ledger is funded as usual, but nothing (gas float or deposits) reaches the hot
-  // wallet on-chain, so it cannot pay until the test funds it with env.devnet.fund
-  fundOnChain?: boolean;
-}
+export type PipelineOptions = SandboxOptions;
 
 export async function openPipeline(
   env: PipelineEnv,
-  { fundOnChain = true }: PipelineOptions = {},
+  options: PipelineOptions = {},
 ): Promise<Pipeline> {
-  const t = await createTestDb();
-  try {
-    const signer = LocalSigner.random();
-    const hot = await hotWallet(env.adapter, signer);
-    const deps: WorkerDeps = {
-      db: t.db,
-      signer,
-      chains: { [env.chain]: hot },
-      timings: testTimings,
-      crash: noCrash,
-    };
-    const requestDeps: RequestDeps = {
-      policy: () => policy,
-      validateAddress: (chain, address) =>
-        chain === env.chain && env.adapter.validateAddress(address),
-    };
-    const userId = `user-${randomUUID()}`;
-    const n = ledgerAsset(env.chain, 'native');
-    const gas = gasFloat(env);
-    if (fundOnChain) await env.devnet.fund(hot.hotAddress, 'native', gas);
-    await t.db.begin((tx) =>
-      post(tx, `fund:${hot.hotAddress}`, 'fund', n, [
-        { account: acct.custody(n), side: 'debit', amount: gas },
-        { account: acct.platform(n), side: 'credit', amount: gas },
-      ]),
-    );
-    let deposits = 0;
-    return {
-      db: t.db,
-      deps,
-      hot,
-      userId,
-      async credit(asset, amount) {
-        const a = ledgerAsset(env.chain, asset);
-        await t.db.begin((tx) =>
-          post(tx, `deposit:${userId}:${++deposits}`, 'deposit', a, [
-            { account: acct.custody(a), side: 'debit', amount },
-            { account: acct.user(userId, a), side: 'credit', amount },
-          ]),
-        );
-        if (fundOnChain) await env.devnet.fund(hot.hotAddress, asset, amount);
-      },
-      async withdraw(asset, amount) {
-        const to = await env.freshAddress();
-        await allowAddress(t.db, userId, env.chain, to);
-        const w = await submitWithdrawal(t.db, requestDeps, {
-          idempotencyKey: randomUUID(),
-          userId,
-          chain: env.chain,
-          asset,
-          to,
-          amount,
-        });
-        if (w.state !== 'APPROVED') throw new Error(`withdrawal is ${w.state}, not APPROVED`);
-        return w;
-      },
-      close: () => t.close(),
-    };
-  } catch (e) {
-    await t.close().catch(() => undefined);
-    throw e;
-  }
+  const s = await openSandbox(env, options);
+  const deps: WorkerDeps = {
+    db: s.db,
+    signer: s.signer,
+    chains: s.chains,
+    timings: testTimings,
+    crash: noCrash,
+  };
+  return { ...s, deps };
 }
 
 async function waitFor(what: string, until: () => Promise<boolean>, timeoutMs: number) {

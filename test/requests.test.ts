@@ -11,7 +11,7 @@ import {
   type RequestDeps,
   type WithdrawalRequest,
 } from '../src/pipeline/requests.js';
-import { createTestDb } from './helpers/test-db.js';
+import { createTestDb } from '../scripts/lib/sandbox.js';
 
 // A fresh schema per test, so the shared in-flight account starts at 0 every time.
 let t: Awaited<ReturnType<typeof createTestDb>>;

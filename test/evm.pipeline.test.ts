@@ -5,7 +5,7 @@ import { config } from '../src/config.js';
 import { acct, balance, ledgerAsset } from '../src/pipeline/ledger.js';
 import { getWithdrawal } from '../src/pipeline/requests.js';
 import { runOnce } from '../src/pipeline/worker.js';
-import { makeEvmEnv } from './helpers/evm-env.js';
+import { makeEvmEnv } from '../scripts/lib/evm-env.js';
 import {
   drive,
   eventsOf,

@@ -1,4 +1,4 @@
-.PHONY: up down test typecheck lint migrate conformance contracts
+.PHONY: up down test typecheck lint migrate conformance faults contracts
 
 node_modules: package-lock.json
 	npm ci
@@ -23,6 +23,10 @@ migrate: node_modules
 
 conformance: node_modules
 	npx vitest run test/*.conformance.test.ts
+
+# Kills worker processes at each crash point and checks every outcome on the chain.
+faults: node_modules
+	npx tsx scripts/fault-run.ts
 
 # Compiles contracts/TestToken.sol with forge inside the Foundry image (solc version from the
 # file's pragma; forge downloads it on first use) and writes only its ABI and bytecode.

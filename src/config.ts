@@ -2,16 +2,17 @@ export const defaults = {
   databaseUrl: 'postgres://kit:kit@127.0.0.1:55432/kit',
   evmRpcUrl: 'http://127.0.0.1:58545',
   bitcoinRpcUrl: 'http://127.0.0.1:58443',
+  // test-only credentials of the regtest node in docker-compose.yml
+  bitcoinRpcAuth: { user: 'kit', password: 'kit' },
 };
 
 export const config = {
   databaseUrl: process.env.DATABASE_URL ?? defaults.databaseUrl,
   evmRpcUrl: process.env.EVM_RPC_URL ?? defaults.evmRpcUrl,
   bitcoinRpcUrl: process.env.BITCOIN_RPC_URL ?? defaults.bitcoinRpcUrl,
-  // test-only credentials of the regtest node in docker-compose.yml
   bitcoinRpcAuth: {
-    user: process.env.BITCOIN_RPC_USER ?? 'kit',
-    password: process.env.BITCOIN_RPC_PASSWORD ?? 'kit',
+    user: process.env.BITCOIN_RPC_USER ?? defaults.bitcoinRpcAuth.user,
+    password: process.env.BITCOIN_RPC_PASSWORD ?? defaults.bitcoinRpcAuth.password,
   },
 };
 

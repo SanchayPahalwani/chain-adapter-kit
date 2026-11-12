@@ -12,6 +12,7 @@ import { getWithdrawal } from '../src/pipeline/requests.js';
 import { verifyAgainstChain } from '../src/pipeline/verify.js';
 import type { PipelineEnv } from '../scripts/lib/env.js';
 import { makeEvmEnv } from '../scripts/lib/evm-env.js';
+import { table, type Outcome } from '../scripts/lib/results.js';
 import { openSandbox, type Sandbox } from '../scripts/lib/sandbox.js';
 import {
   spawnWorker,
@@ -250,15 +251,16 @@ describe('fault run', () => {
   });
 });
 
-// The script end to end, on two scenarios: the whole quick matrix is a separate CI step.
+// The script end to end, on two scenarios and both chains: the whole quick matrix is a separate CI
+// step.
 describe('fault-run script', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
 
   it(
     'X4 the quick fault run exits 0 and reports zero sent twice, lost, unfinished and drift',
-    // more than the two scenarios' own time limits together (140 s and 50 s), so a slow run
-    // fails with the script's reason
-    { timeout: 240_000 },
+    // more than the two scenarios' own time limits on two chains together (2 x (140 s + 50 s)),
+    // so a slow run fails with the script's reason
+    { timeout: 420_000 },
     async () => {
       const args = ['--quick', '--no-write', '--json', '--only', 'random_kills,duplicate_requests'];
       const child = spawn('npx', ['tsx', 'scripts/fault-run.ts', ...args], {
@@ -280,23 +282,71 @@ describe('fault-run script', () => {
 
       const out = JSON.parse(stdout) as {
         passed: boolean;
+        chains: { chain: string; node: string }[];
         scenarios: {
+          chain: string;
           name: string;
           kills: number;
           killsMidHandler: number;
           withdrawals: number;
+          settled: number;
           rejected: number;
         }[];
         totals: Record<string, number | string> | null;
       };
       expect(out.passed).toBe(true);
-      expect(out.scenarios.map((s) => s.name)).toEqual(['random_kills', 'duplicate_requests']);
+      expect(out.chains.map((c) => c.chain)).toEqual(['evm-anvil', 'bitcoin-regtest']);
+      expect(out.scenarios.map((s) => `${s.chain} ${s.name}`)).toEqual([
+        'evm-anvil random_kills',
+        'evm-anvil duplicate_requests',
+        'bitcoin-regtest random_kills',
+        'bitcoin-regtest duplicate_requests',
+      ]);
       expect(out.totals).toMatchObject({ sentTwice: 0, lost: 0, unfinished: 0, drift: '0' });
-      const [randomKills, duplicates] = out.scenarios;
-      expect(randomKills?.kills).toBeGreaterThan(0);
-      expect(randomKills?.killsMidHandler).toBeGreaterThan(0); // a kill interrupted a handler
-      expect(randomKills?.withdrawals).toBe(40);
-      expect(duplicates?.rejected).toBe(2); // one not allowlisted, one over the limit
+      for (const s of out.scenarios) {
+        if (s.name === 'random_kills') {
+          expect(s.killsMidHandler).toBeGreaterThanOrEqual(3); // the --quick minimum
+          expect(s.withdrawals).toBeGreaterThanOrEqual(40); // batches until the minimum held
+          expect(s.settled).toBe(s.withdrawals);
+        } else {
+          expect(s.rejected).toBe(2); // one not allowlisted, one over the limit
+        }
+      }
     },
   );
+
+  it('X6 the table has a chain column, and a scenario a chain cannot produce reads not applicable', () => {
+    const verdict = {
+      withdrawals: 2,
+      settled: 2,
+      rejected: 0,
+      failed: 0,
+      sentTwice: 0,
+      lost: 0,
+      unfinished: 0,
+    };
+    const outcomes: Outcome[] = [
+      {
+        chain: 'evm-anvil',
+        name: 'reorg',
+        title: 'reorg before finality',
+        about: '',
+        graded: { kills: 0, killsMidHandler: 0, verdict, drift: 0n, problems: [] },
+      },
+      {
+        chain: 'other-chain',
+        name: 'reorg',
+        title: 'reorg before finality',
+        about: '',
+        notApplicable: 'its blocks are final at once',
+      },
+    ];
+    expect(table(outcomes, null).split('\n')).toEqual([
+      '| Chain       | Scenario                               | Withdrawals | Worker kills | Settled | Rejected | Sent twice | Lost | Unfinished | Ledger drift |',
+      '|-------------|----------------------------------------|------------:|-------------:|--------:|---------:|-----------:|-----:|-----------:|-------------:|',
+      '| evm-anvil   | reorg before finality                  |           2 |            0 |       2 |        0 |          0 |    0 |          0 |            0 |',
+      '| other-chain | reorg before finality (not applicable) |           - |            - |       - |        - |          - |    - |          - |            - |',
+      '',
+    ]);
+  });
 });

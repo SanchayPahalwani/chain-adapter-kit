@@ -49,6 +49,16 @@ export async function createTestDb(): Promise<TestDb> {
 // native the hot wallet holds for fees, booked as the platform's own
 export const gasFloat = (env: PipelineEnv) => 100n * env.unit('native');
 
+// `amount` on-chain in env.fundingPieces payments, the last with the remainder, so a chain that
+// spends coins gets that many coins, each one for a withdrawal in flight
+async function fundInPieces(env: PipelineEnv, address: string, asset: AssetId, amount: bigint) {
+  const n = BigInt(env.fundingPieces);
+  const piece = amount / n;
+  for (let i = 1n; i <= n; i++) {
+    await env.devnet.fund(address, asset, i < n ? piece : amount - piece * (n - 1n));
+  }
+}
+
 const unlimited = 10n ** 40n;
 export const sandboxPolicy: AssetPolicy = {
   perWithdrawalMax: unlimited,
@@ -104,7 +114,7 @@ export async function openSandbox(
     }
     for (const [asset, amount] of floats) {
       const a = ledgerAsset(env.chain, asset);
-      if (fundOnChain) await env.devnet.fund(hot.hotAddress, asset, amount);
+      if (fundOnChain) await fundInPieces(env, hot.hotAddress, asset, amount);
       await t.db.begin((tx) =>
         post(tx, `fund:${hot.hotAddress}:${asset}`, 'fund', a, [
           { account: acct.custody(a), side: 'debit', amount },
@@ -133,7 +143,7 @@ export async function openSandbox(
             { account: acct.user(userId, a), side: 'credit', amount },
           ]),
         );
-        if (fundOnChain) await env.devnet.fund(hot.hotAddress, asset, amount);
+        if (fundOnChain) await fundInPieces(env, hot.hotAddress, asset, amount);
       },
       allowFresh,
       async withdraw(asset, amount) {

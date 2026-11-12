@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { config, defaults } from '../src/config.js';
 import { buildRuntime, readRuntimeEnv } from '../src/pipeline/runtime.js';
+import { makeBitcoinEnv } from '../scripts/lib/bitcoin-env.js';
 import type { PipelineEnv } from '../scripts/lib/env.js';
 import { makeEvmEnv } from '../scripts/lib/evm-env.js';
 import { openSandbox, type Sandbox } from '../scripts/lib/sandbox.js';
@@ -78,6 +79,53 @@ describe('worker runtime from an environment', () => {
         const token = env.assets[1];
         if (!token) throw new Error('the env has no token');
         expect(await rt.adapter.getBalance(box.hot.hotAddress, token)).toBe(0n);
+      } finally {
+        await deps.db.end();
+      }
+    });
+  });
+
+  describe('buildRuntime on Bitcoin', () => {
+    let env: PipelineEnv;
+    let box: Sandbox;
+    beforeAll(async () => {
+      env = await makeBitcoinEnv();
+      box = await openSandbox(env, { fundOnChain: false }); // no coins needed here
+    });
+    afterAll(async () => {
+      await box.close();
+    });
+
+    it.each([
+      [
+        { BITCOIN_RPC_URL: 'ftp://127.0.0.1' },
+        /BITCOIN_RPC_URL: not an http URL: ftp:\/\/127.0.0.1/,
+      ],
+      [{ KIT_BITCOIN_FINALITY_DEPTH: '0' }, /KIT_BITCOIN_FINALITY_DEPTH: bad depth 0/],
+      // the node refuses the credentials: they are read from the env given, not from config
+      [{ BITCOIN_RPC_USER: 'nobody' }, /bitcoind getblockchaininfo: HTTP 401/],
+      [{ BITCOIN_RPC_PASSWORD: 'wrong' }, /bitcoind getblockchaininfo: HTTP 401/],
+    ])('a bad chain variable %j throws %s', async (bad, message) => {
+      await expect(buildRuntime(readRuntimeEnv({ ...box.workerEnv(), ...bad }))).rejects.toThrow(
+        message,
+      );
+    });
+
+    it('builds the same hot wallet, node and finality depth as the sandbox', async () => {
+      expect(box.workerEnv()).toMatchObject({
+        KIT_CHAINS: 'bitcoin-regtest',
+        BITCOIN_RPC_URL: config.bitcoinRpcUrl,
+        BITCOIN_RPC_USER: config.bitcoinRpcAuth.user,
+        BITCOIN_RPC_PASSWORD: config.bitcoinRpcAuth.password,
+      });
+      const deps = await buildRuntime(readRuntimeEnv(box.workerEnv()));
+      try {
+        const rt = deps.chains[env.chain];
+        if (!rt) throw new Error(`no runtime for ${env.chain}`);
+        expect(rt.hotAddress).toBe(box.hot.hotAddress);
+        // 2 here, where the adapter's own default is 3: KIT_BITCOIN_FINALITY_DEPTH was read
+        expect(rt.adapter.finalityDepth).toBe(env.adapter.finalityDepth);
+        expect(await rt.adapter.getTip()).toEqual(await env.adapter.getTip());
       } finally {
         await deps.db.end();
       }

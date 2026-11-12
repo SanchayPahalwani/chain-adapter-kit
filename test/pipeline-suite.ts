@@ -556,8 +556,10 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
         expect(['APPROVED', 'RESERVED', 'SIGNED', 'BROADCAST']).toContain(await state(w.id));
         return elapsed();
       });
-      expect(['SIGNED', 'BROADCAST']).toContain(await state(w.id));
-      // a rejected re-send is recorded on the row, not as an event per poll
+      // Where it waits depends on the chain, so only "never terminal" is checked (above, at every
+      // step): on EVM it is signed and sent, and the node refuses the transfer; on Bitcoin the
+      // reservation finds no coin and the withdrawal stays APPROVED. Either failure is recorded
+      // on the row (a refused re-send too), not as an event per poll.
       const [row] = await p.db<{ last_error: string | null }[]>`
         select last_error from withdrawals where id = ${w.id}`;
       expect(row?.last_error).toBeTruthy();

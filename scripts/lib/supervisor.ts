@@ -95,8 +95,9 @@ export interface SuperviseOptions {
   killAfterMs?: number;
   // The work, started once every first worker has run killAfterMs; there are no kills before
   // that, and `until` counts only once the work has finished. Work there from the start would be
-  // partly done (on a fast machine, all of it) before any worker could be killed.
-  submit?: () => Promise<void>;
+  // partly done (on a fast machine, all of it) before any worker could be killed. `sofar` reads
+  // the kills up to now, so the work can go on until enough of them have happened.
+  submit?: (sofar: () => Omit<Supervised, 'timedOut'>) => Promise<void>;
   until?: () => Promise<boolean>; // when to stop (default: every withdrawal is terminal)
 }
 
@@ -176,7 +177,7 @@ export async function supervise(
         live.set(child, once(child, 'exit') as Promise<Exit>);
       }
       if (submit && !work.started && [...live.keys()].every(killable)) {
-        work.started = submit().then(
+        work.started = submit(() => ({ kills, killsMidHandler })).then(
           () => void (work.finished = true),
           (thrown: unknown) => void (work.error = { thrown }),
         );

@@ -2,6 +2,7 @@
 // the env it is given, never from process.env, checking the settings before it connects, and names
 // the assets it serves. Adding a chain adds an entry here; the pipeline names none.
 import { isAddress } from 'viem';
+import { createBitcoinAdapter } from './adapters/bitcoin/adapter.js';
 import { createEvmAdapter } from './adapters/evm/adapter.js';
 import { commaList, defaults, must, urlScheme } from './config.js';
 import type { AssetId, ChainAdapter } from './core/adapter.js';
@@ -13,26 +14,48 @@ interface Chain {
   assets(env: Env): AssetId[]; // what the kit serves on this chain, 'native' first
 }
 
+function httpUrl(env: Env, name: string, fallback: string): string {
+  const url = env[name] || fallback;
+  must(['http:', 'https:'].includes(urlScheme(url)), `${name}: not an http URL: ${url}`);
+  return url;
+}
+
+// unset: the adapter's own default
+function finalityDepth(env: Env, name: string): number | undefined {
+  const depth = env[name] || undefined;
+  must(!depth || /^[1-9][0-9]{0,2}$/.test(depth), `${name}: bad depth ${depth}`);
+  return depth ? Number(depth) : undefined;
+}
+
 const registry: Record<string, Chain> = {
   'evm-anvil': {
     async build(env) {
-      const rpcUrl = env.EVM_RPC_URL || defaults.evmRpcUrl;
-      must(
-        ['http:', 'https:'].includes(urlScheme(rpcUrl)),
-        `EVM_RPC_URL: not an http URL: ${rpcUrl}`,
-      );
+      const rpcUrl = httpUrl(env, 'EVM_RPC_URL', defaults.evmRpcUrl);
       const tokens = commaList(env.KIT_EVM_TOKENS);
       const bad = tokens.find((t) => !isAddress(t));
       must(bad === undefined, `KIT_EVM_TOKENS: ${bad} is not a contract address`);
-      const depth = env.KIT_EVM_FINALITY_DEPTH || undefined;
-      must(!depth || /^[1-9][0-9]{0,2}$/.test(depth), `KIT_EVM_FINALITY_DEPTH: bad depth ${depth}`);
       return await createEvmAdapter({
         rpcUrl,
         tokens,
-        finalityDepth: depth ? Number(depth) : undefined,
+        finalityDepth: finalityDepth(env, 'KIT_EVM_FINALITY_DEPTH'),
       });
     },
     assets: (env) => ['native', ...commaList(env.KIT_EVM_TOKENS)],
+  },
+  'bitcoin-regtest': {
+    async build(env) {
+      const rpcUrl = httpUrl(env, 'BITCOIN_RPC_URL', defaults.bitcoinRpcUrl);
+      const depth = finalityDepth(env, 'KIT_BITCOIN_FINALITY_DEPTH');
+      return await createBitcoinAdapter({
+        rpcUrl,
+        auth: {
+          user: env.BITCOIN_RPC_USER || defaults.bitcoinRpcAuth.user,
+          password: env.BITCOIN_RPC_PASSWORD || defaults.bitcoinRpcAuth.password,
+        },
+        finalityDepth: depth,
+      });
+    },
+    assets: () => ['native'],
   },
 };
 

@@ -45,8 +45,14 @@ interface Coin {
   script: Uint8Array;
 }
 
-// Spends `coin` (owned by the key) to `to` for a fee of 400 sat, signed with the key.
-async function signSpend(key: Awaited<ReturnType<typeof newKey>>, coin: Coin, to: string) {
+// Spends `coin` (owned by the key) to `to` for `fee` sat, signed with the key. One input and
+// one output: 110 vB, so the default 400 sat is about 3.6 sat/vB.
+async function signSpend(
+  key: Awaited<ReturnType<typeof newKey>>,
+  coin: Coin,
+  to: string,
+  fee = 400n,
+) {
   const tx = new Transaction({ version: 2, lockTime: 0 });
   tx.addInput({
     txid: hexToBytes(coin.txid),
@@ -54,7 +60,7 @@ async function signSpend(key: Awaited<ReturnType<typeof newKey>>, coin: Coin, to
     sequence: 0xfffffffd,
     witnessUtxo: { script: coin.script, amount: coin.amount },
   });
-  const out = coin.amount - 400n;
+  const out = coin.amount - fee;
   tx.addOutputAddress(to, out, REGTEST);
   const program = OutScript.decode(coin.script);
   if (program.type !== 'wpkh') throw new Error('expected a P2WPKH coin');
@@ -70,7 +76,7 @@ async function signSpend(key: Awaited<ReturnType<typeof newKey>>, coin: Coin, to
 }
 
 // Spends the address's one confirmed coin.
-async function spendFrom(key: Awaited<ReturnType<typeof newKey>>, to: string) {
+async function spendFrom(key: Awaited<ReturnType<typeof newKey>>, to: string, fee?: bigint) {
   const [coin] = await coins(key.address);
   if (!coin) throw new Error(`no coin at ${key.address}`);
   return signSpend(
@@ -82,6 +88,7 @@ async function spendFrom(key: Awaited<ReturnType<typeof newKey>>, to: string) {
       script: hexToBytes(coin.scriptPubKey),
     },
     to,
+    fee,
   );
 }
 
@@ -213,5 +220,36 @@ describe('bitcoin devnet', () => {
     const failure = await down.call('getblockcount').catch((e: unknown) => e);
     expect(failure).toBeInstanceOf(Error);
     expect(failure).not.toBeInstanceOf(RpcError);
+  });
+
+  it('D8 mineAtLeast mines what pays the rate, and a child only once its parent is mined', async () => {
+    const [k1, k2, k3, k4] = await Promise.all([newKey(), newKey(), newKey(), newKey()]);
+    await devnet.fund(k1.address, 'native', 100_000n);
+    await devnet.fund(k4.address, 'native', 100_000n);
+    const low = await spendFrom(k1, k2.address, 220n); // 2 sat/vB
+    const child = await signSpend(
+      k2,
+      {
+        txid: low.txid,
+        vout: 0,
+        amount: low.out,
+        script: p2wpkh(await k2.signer.publicKey('k', 'secp256k1'), REGTEST).script,
+      },
+      k3.address,
+      2_000n, // well above the rate, but its parent is not
+    );
+    const high = await spendFrom(k4, k3.address); // 400 sat: about 3.6 sat/vB
+    for (const tx of [low, child, high]) await devnet.rpc.call('sendrawtransaction', [tx.raw]);
+    const before = await height();
+
+    await devnet.mineAtLeast(1, 3n);
+
+    expect(await height()).toBe(before + 1);
+    expect(await inMempool(high.txid)).toBe(false);
+    expect(await inMempool(low.txid)).toBe(true);
+    expect(await inMempool(child.txid)).toBe(true);
+    await devnet.mine(1);
+    expect(await inMempool(low.txid)).toBe(false);
+    expect(await inMempool(child.txid)).toBe(false);
   });
 });

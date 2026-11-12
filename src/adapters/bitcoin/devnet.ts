@@ -3,7 +3,7 @@ import { p2wpkh } from '@scure/btc-signer';
 import type { AssetId } from '../../core/adapter.js';
 import type { Devnet } from '../../conformance/harness.js';
 import { REGTEST } from './adapter.js';
-import { RpcError, bitcoinRpc, type BitcoinRpc } from './rpc.js';
+import { RpcError, bitcoinRpc, btcToSats, type BitcoinRpc } from './rpc.js';
 
 const FUNDER = 'funder';
 const ENOUGH = 100; // BTC; while the funder holds less, the blocks pay it
@@ -12,12 +12,17 @@ const EXPIRY_HOURS = 336; // bitcoind's default -mempoolexpiry
 
 export interface BitcoinDevnet extends Devnet {
   rpc: BitcoinRpc;
+  // Mines `blocks` blocks that hold only the mempool transactions paying at least `satPerVb` by
+  // the node's BIP-141 vsize (and only once their mempool parents are in); the rest stay pending.
+  mineAtLeast(blocks: number, satPerVb: bigint): Promise<void>;
 }
 
 interface MempoolEntry {
   time: number;
   ancestorcount: number;
   depends: string[];
+  vsize_bip141: number;
+  fees: { base: number };
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -103,6 +108,21 @@ export async function createBitcoinDevnet(
     },
 
     mine,
+
+    async mineAtLeast(blocks: number, satPerVb: bigint) {
+      for (let i = 0; i < blocks; i++) {
+        // fewer ancestors first: parents before children, the order generateblock needs
+        const pool = Object.entries(await mempool()).sort(
+          ([, a], [, b]) => a.ancestorcount - b.ancestorcount,
+        );
+        const picked = new Set<string>();
+        for (const [txid, e] of pool) {
+          const pays = btcToSats(e.fees.base) >= satPerVb * BigInt(e.vsize_bip141);
+          if (pays && e.depends.every((parent) => picked.has(parent))) picked.add(txid);
+        }
+        await rpc.call('generateblock', [await minerAddress(), [...picked]]);
+      }
+    },
 
     // Replaces the last `depth` blocks with empty ones at the same heights. Their
     // transactions go back to the mempool, so they are pending, not confirmed.

@@ -9,8 +9,10 @@ export interface BitcoinAdapterOptions {
   rpcUrl: string;
   auth: { user: string; password: string };
   finalityDepth?: number; // default 3
-  feeRate?: bigint; // sat/vB, default 2
+  feeRate?: bigint; // sat/vB, default DEFAULT_FEE_RATE
 }
+
+export const DEFAULT_FEE_RATE = 2n; // sat/vB
 
 const chain = 'bitcoin-regtest';
 export const REGTEST = { bech32: 'bcrt', pubKeyHash: 0x6f, scriptHash: 0xc4, wif: 0xef };
@@ -119,7 +121,7 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   if (index.txindex?.synced !== true) {
     throw new Error('the node needs a synced transaction index: start bitcoind with -txindex=1');
   }
-  const feeRate = opts.feeRate ?? 2n;
+  const feeRate = opts.feeRate ?? DEFAULT_FEE_RATE;
   if (feeRate <= 0n) throw new Error(`fee rate must be above 0 sat/vB, got ${feeRate}`);
   // What quoteFee quotes, and the least a replacement pays. Fixed: estimatesmartfee answers
   // "Insufficient data" on regtest, where blocks hold a few payments. A real network would use

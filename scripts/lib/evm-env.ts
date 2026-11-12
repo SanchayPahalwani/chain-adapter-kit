@@ -50,7 +50,9 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
       KIT_EVM_TOKENS: token,
       KIT_EVM_FINALITY_DEPTH: String(adapter.finalityDepth),
     },
+    fundingPieces: 1, // a nonce, not coins: one balance pays any number of withdrawals
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
+    reorgKeepsMempool: false, // anvil_reorg drops the removed blocks' transactions
     async makeStuck() {
       stuck = true;
       // The raised base fee applies from the next mined block on (mine() sets it again before

@@ -2,6 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChainAdapter, SignedTx } from '../src/core/adapter.js';
 import { startMiner } from '../src/conformance/harness.js';
+import { LocalSigner } from '../src/core/local-signer.js';
 import { noCrash } from '../src/pipeline/crash.js';
 import type { Db } from '../src/pipeline/db.js';
 import { acct, balance, ledgerAsset } from '../src/pipeline/ledger.js';
@@ -9,6 +10,7 @@ import { getWithdrawal, type Withdrawal, type WithdrawalState } from '../src/pip
 import { handlers, LostRace } from '../src/pipeline/steps.js';
 import {
   claim,
+  hotWallet,
   runOnce,
   runWorker,
   type Timings,
@@ -603,6 +605,58 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(row?.last_error).toMatch(/duplicate key/);
       expect(row?.later).toBe(true); // backed off, not re-claimed at once
       expect(await attemptsOf(p.db, b.id)).toHaveLength(0);
+    });
+
+    it('F7 a worker with another signing key cannot replace an attempt: the step fails, nothing more is sent', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const first = await toBroadcast(p.deps, w);
+      const stale = { ...p.deps.timings, stuckAfterMs: 0 }; // so every track run tries to replace
+      const rt = p.deps.chains[env.chain];
+      if (!rt) throw new Error(`no runtime for ${env.chain}`);
+      // restarted with another seed: another hot wallet, which did not reserve this withdrawal
+      const reseeded = LocalSigner.random();
+      const restarted: WorkerDeps = {
+        ...p.deps,
+        signer: reseeded,
+        chains: { [env.chain]: await hotWallet(rt.adapter, reseeded) },
+        timings: stale,
+      };
+      // the key behind the configured hot address rotated: same address, another key
+      const rotated: WorkerDeps = { ...p.deps, signer: LocalSigner.random(), timings: stale };
+      const row = async () => {
+        const [r] = await p.db<{ state: string; error_count: number; last_error: string | null }[]>`
+          select state, error_count, last_error from withdrawals where id = ${w.id}`;
+        if (!r) throw new Error('no withdrawal');
+        return r;
+      };
+      for (const [deps, refusal] of [
+        [restarted, /differs from the previous attempt/],
+        [rotated, /not the sender|does not own the input/],
+      ] as const) {
+        const errors = (await row()).error_count;
+        // until the step fails, or (what must not happen) a second attempt is stored
+        const failedOrReplaced = async () =>
+          (await row()).error_count > errors || (await attemptsOf(p.db, w.id)).length > 1;
+        await driveWithoutMining(deps, failedOrReplaced);
+        expect(await row()).toMatchObject({
+          state: 'BROADCAST',
+          last_error: expect.stringMatching(refusal) as string,
+        });
+        expect((await attemptsOf(p.db, w.id)).map((a) => a.txid)).toEqual([first.txid]);
+        expect(await eventsOf(p.db, w.id)).not.toContain('replacement');
+      }
+      expect(await env.devnet.pendingFrom(p.hot.hotAddress)).toBe(1); // only the first attempt
+
+      // the right key, and no attempt stale: it settles on the first attempt alone
+      const patient = { ...p.deps, timings: { ...p.deps.timings, stuckAfterMs: 60_000 } };
+      await drive(patient, env, terminal(p.db, w.id));
+      const done = await getWithdrawal(p.db, w.id);
+      expect(done.state).toBe('SETTLED');
+      expect(done.settledTxid).toBe(first.txid);
+      expect(await attemptsOf(p.db, w.id)).toHaveLength(1);
+      expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
     });
 
     it('F6 attempts stop at maxAttempts', async () => {

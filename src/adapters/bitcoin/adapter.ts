@@ -3,7 +3,7 @@ import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { Address, OutScript, SigHash, Transaction, p2wpkh } from '@scure/btc-signer';
 import { hash160 } from '@scure/btc-signer/utils.js';
 import type { ChainAdapter, TransferIntent, TxStatus } from '../../core/adapter.js';
-import { RpcError, bitcoinRpc, btcToSats } from './rpc.js';
+import { RpcError, bitcoinRpc, btcToSats, scanAddress } from './rpc.js';
 
 export interface BitcoinAdapterOptions {
   rpcUrl: string;
@@ -29,12 +29,6 @@ type Reservation = { coins: Coins };
 // The unsigned transaction, and what its digests commit to besides it: each input's amount, and
 // its script, which is that of `from` (every input is a coin of the sender).
 type Body = { tx: string; from: string; amounts: string[] };
-
-interface Scan {
-  success: boolean;
-  total_amount: number;
-  unspents: { txid: string; vout: number; amount: number }[];
-}
 
 interface Block {
   previousblockhash?: string; // absent on the genesis block
@@ -128,24 +122,6 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   // estimatesmartfee, raised to the mempoolminfee.
   const marketRate = () => feeRate;
 
-  // The node scans the UTXO set for one caller at a time and answers -8 to any other (this
-  // adapter or another client), so wait up to 5 s for that scan to finish.
-  async function scan(address: string): Promise<Scan> {
-    const deadline = Date.now() + 5_000;
-    for (;;) {
-      try {
-        const result = await rpc.call<Scan>('scantxoutset', ['start', [`addr(${address})`]]);
-        if (!result.success) throw new Error(`the scan for ${address} was aborted`);
-        return result;
-      } catch (error) {
-        const busy =
-          error instanceof RpcError && error.code === -8 && /in progress/.test(error.message);
-        if (!busy || Date.now() > deadline) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-  }
-
   // In the mempool, or in a block of the active chain.
   async function nodeHas(txid: string): Promise<boolean> {
     return (await getTxStatus(txid)).state !== 'unknown';
@@ -193,7 +169,7 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
     // Confirmed coins only: the UTXO set holds no mempool outputs.
     async getBalance(address, asset) {
       native(asset);
-      return btcToSats((await scan(address)).total_amount);
+      return btcToSats((await scanAddress(rpc, address)).total_amount);
     },
 
     async getTip() {
@@ -216,7 +192,7 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
     // away: it stays in the store, and the transfer that spends it is rejected by the node, which
     // loses no money.
     async syncInputs(store, address) {
-      const { unspents } = await scan(address);
+      const { unspents } = await scanAddress(rpc, address);
       await store.putCoins(
         unspents.map((u) => ({
           id: `${u.txid}:${u.vout}`,

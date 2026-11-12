@@ -10,7 +10,11 @@ export interface Devnet {
   mine(blocks: number): Promise<void>;
   dropFromMempool(txid: string): Promise<void>;
   reorg(depth: number): Promise<void>;
-  /** The number of transactions from `address` the node holds but has not mined, including ones it cannot mine yet. */
+  /**
+   * The number of transactions from `address` the node holds but has not mined, including ones
+   * it cannot mine yet. On a UTXO chain, the mempool transactions that spend one of the
+   * address's confirmed coins: a spend of an unconfirmed output of the address is not counted.
+   */
   pendingFrom(address: string): Promise<number>;
 }
 

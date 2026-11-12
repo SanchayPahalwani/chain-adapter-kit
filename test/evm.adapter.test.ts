@@ -3,13 +3,25 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { hexToBytes } from '@noble/curves/utils.js';
-import { BlockNotFoundError, HttpRequestError, createPublicClient, http, type Hash } from 'viem';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { bytesToNumberBE, hexToBytes, numberToBytesBE } from '@noble/curves/utils.js';
+import {
+  BlockNotFoundError,
+  HttpRequestError,
+  createPublicClient,
+  http,
+  keccak256,
+  numberToHex,
+  parseTransaction,
+  recoverTransactionAddress,
+  type Hash,
+  type Hex,
+} from 'viem';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createEvmAdapter } from '../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../src/adapters/evm/devnet.js';
 import { config } from '../src/config.js';
-import type { ChainAdapter, InputStore, Json, UnsignedTx } from '../src/core/adapter.js';
+import type { ChainAdapter, InputStore, Json } from '../src/core/adapter.js';
 import { LocalSigner } from '../src/core/local-signer.js';
 import { MemoryInputStore } from '../src/core/memory-input-store.js';
 
@@ -228,26 +240,81 @@ describe('EVM adapter against a stub node', () => {
     await expect(adapter.scanBlock(5)).rejects.toThrow(/block 5 changed in the scan/);
   });
 
-  it('attachSignatures accepts recovery id 0 or 1 only', () => {
-    const unsigned: UnsignedTx = {
-      body: {
-        chainId: '31337',
-        nonce: '0',
-        to: '0x52908400098527886E0F7030069857D2E4169EE7',
-        value: '1',
-        data: '0x',
-        gas: '21000',
-        maxFeePerGas: '2000000000',
-        maxPriorityFeePerGas: '1000000000',
-      },
-      signingPayloads: [],
+  // A native transfer from the key `keyId` of `signer`, nonce 0; building it needs no node.
+  async function unsignedFrom(signer: LocalSigner, keyId: string) {
+    const from = adapter.deriveAddress(await signer.publicKey(keyId, 'secp256k1'));
+    const intent = {
+      from,
+      to: '0x52908400098527886E0F7030069857D2E4169EE7',
+      asset: 'native',
+      amount: 1n,
     };
-    const sig = (recovery: number) => new Uint8Array([...new Uint8Array(64).fill(0x34), recovery]);
-    expect(adapter.attachSignatures(unsigned, [sig(0)]).raw).not.toBe(
-      adapter.attachSignatures(unsigned, [sig(1)]).raw,
+    const fee = {
+      gasLimit: '21000',
+      maxFeePerGas: '2000000000',
+      maxPriorityFeePerGas: '1000000000',
+    };
+    const unsigned = await adapter.buildTransfer(intent, { nonce: '0' }, fee);
+    const sign = (key: string) =>
+      signer.sign(key, 'secp256k1', hexToBytes(unsigned.signingPayloads[0]!));
+    return { from, unsigned, sign };
+  }
+
+  it('attachSignatures accepts only a signature by the sender in the body, recovery id 0 or 1', async () => {
+    const signer = LocalSigner.random();
+    const { from, unsigned, sign } = await unsignedFrom(signer, 'hot');
+    expect((unsigned.body as { from: string }).from).toBe(from);
+    const good = await sign('hot');
+    const signed = adapter.attachSignatures(unsigned, [good]);
+    expect(signed.txid).toBe(keccak256(signed.raw as Hex));
+    expect(
+      await recoverTransactionAddress({ serializedTransaction: signed.raw as `0x02${string}` }),
+    ).toBe(from);
+
+    // another key of the same signer, a key of another signer: each would send from another address
+    const otherKey = await sign('other');
+    expect(() => adapter.attachSignatures(unsigned, [otherKey])).toThrow(
+      new RegExp(`^signed by 0x[0-9a-fA-F]{40}, not the sender ${from}$`),
     );
-    expect(() => adapter.attachSignatures(unsigned, [sig(27)])).toThrow(/recovery id/);
-    expect(() => adapter.attachSignatures(unsigned, [sig(2)])).toThrow(/recovery id/);
+    const otherSeed = await LocalSigner.random().sign(
+      'hot',
+      'secp256k1',
+      hexToBytes(unsigned.signingPayloads[0]!),
+    );
+    expect(() => adapter.attachSignatures(unsigned, [otherSeed])).toThrow(/not the sender/);
+    // the right key with the other recovery id recovers some other key
+    const flipped = Uint8Array.from(good);
+    flipped[64] = flipped[64]! ^ 1;
+    expect(() => adapter.attachSignatures(unsigned, [flipped])).toThrow(/not the sender/);
+    // a 27/28 signer, and a recovery id viem would read as 1
+    for (const recovery of [27, 2]) {
+      const bad = Uint8Array.from(good);
+      bad[64] = recovery;
+      expect(() => adapter.attachSignatures(unsigned, [bad])).toThrow(/recovery id must be 0 or 1/);
+    }
+    // a body from before the sender was part of it is refused, not signed for nobody
+    const noSender: Record<string, Json> = { ...(unsigned.body as Record<string, Json>) };
+    delete noSender.from;
+    expect(() => adapter.attachSignatures({ ...unsigned, body: noSender }, [good])).toThrow(
+      /not the sender undefined/,
+    );
+  });
+
+  it('attachSignatures takes a high-S signature as its low-S form', async () => {
+    const signer = LocalSigner.random();
+    const { unsigned, sign } = await unsignedFrom(signer, 'hot');
+    const low = await sign('hot'); // LocalSigner (noble) signs low-S
+    const s = bytesToNumberBE(low.subarray(32, 64));
+    expect(s <= secp256k1.Point.Fn.ORDER / 2n).toBe(true);
+    // (r, n - s) with the other recovery id: the same key's signature in high-S form
+    const high = Uint8Array.of(
+      ...low.subarray(0, 32),
+      ...numberToBytesBE(secp256k1.Point.Fn.ORDER - s, 32),
+      low[64]! ^ 1,
+    );
+    const signed = adapter.attachSignatures(unsigned, [low]);
+    expect(adapter.attachSignatures(unsigned, [high])).toEqual(signed);
+    expect(parseTransaction(signed.raw as Hex).s).toBe(numberToHex(s, { size: 32 }));
   });
 });
 
@@ -363,6 +430,25 @@ describe('EVM adapter broadcast against anvil', () => {
       maxFeePerGas: fee.maxFeePerGas,
       maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
     });
+  });
+
+  it('buildReplacement refuses a sender or a nonce other than the previous attempt', async () => {
+    const from = await wallet();
+    const previous = await unsignedTransfer(from, new MemoryInputStore());
+    const { nonce } = previous.reservation as { nonce: string };
+    // control: the same sender and reservation are replaced
+    await expect(
+      adapter.buildReplacement(previous.intent, previous.reservation, previous),
+    ).resolves.toMatchObject({ unsigned: { body: { from: from.address, nonce } } });
+
+    const other = (await wallet()).address;
+    await expect(
+      adapter.buildReplacement({ ...previous.intent, from: other }, previous.reservation, previous),
+    ).rejects.toThrow(`the sender ${other} differs from the previous attempt's ${from.address}`);
+    const next = String(BigInt(nonce) + 1n);
+    await expect(
+      adapter.buildReplacement(previous.intent, { nonce: next }, previous),
+    ).rejects.toThrow(`the reservation (nonce ${next}) differs from the previous attempt's nonce`);
   });
 
   it('buildReplacement follows the market when it is above the bumped fee', async () => {

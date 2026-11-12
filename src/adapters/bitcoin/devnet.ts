@@ -3,7 +3,7 @@ import { p2wpkh } from '@scure/btc-signer';
 import type { AssetId } from '../../core/adapter.js';
 import type { Devnet } from '../../conformance/harness.js';
 import { REGTEST } from './adapter.js';
-import { RpcError, bitcoinRpc, btcToSats, type BitcoinRpc } from './rpc.js';
+import { RpcError, bitcoinRpc, btcToSats, scanAddress, type BitcoinRpc } from './rpc.js';
 
 const FUNDER = 'funder';
 const ENOUGH = 100; // BTC; while the funder holds less, the blocks pay it
@@ -25,7 +25,6 @@ interface MempoolEntry {
   fees: { base: number };
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const satsToBtc = (sats: bigint) =>
   `${sats / 100_000_000n}.${(sats % 100_000_000n).toString().padStart(8, '0')}`;
 
@@ -56,23 +55,6 @@ export async function createBitcoinDevnet(
   }
   if ((await funder<number>('getbalance')) < 50) {
     await rpc.call('generatetoaddress', [101, await freshAddress()]);
-  }
-
-  // The node scans the UTXO set for one caller at a time; a parallel scan answers -8.
-  async function scan(address: string) {
-    const deadline = Date.now() + 5_000;
-    for (;;) {
-      try {
-        const r = await rpc.call<{ unspents: { txid: string; vout: number }[] }>('scantxoutset', [
-          'start',
-          [`addr(${address})`],
-        ]);
-        return r.unspents;
-      } catch (error) {
-        if (!(error instanceof RpcError && error.code === -8) || Date.now() > deadline) throw error;
-        await sleep(50);
-      }
-    }
   }
 
   const mempool = () => rpc.call<Record<string, MempoolEntry>>('getrawmempool', [true]);
@@ -202,7 +184,7 @@ export async function createBitcoinDevnet(
     // Confirmed coins of the address (scantxoutset sees no mempool outputs), then who spends
     // them in the mempool. A spend of an unconfirmed output of the address is not counted.
     async pendingFrom(address: string) {
-      const coins = await scan(address);
+      const { unspents: coins } = await scanAddress(rpc, address);
       if (coins.length === 0) return 0;
       const spends = await rpc.call<{ spendingtxid?: string }[]>('gettxspendingprevout', [
         coins.map(({ txid, vout }) => ({ txid, vout })),

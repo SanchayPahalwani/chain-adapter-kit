@@ -9,6 +9,7 @@ import {
   encodeFunctionData,
   erc20Abi,
   getAddress,
+  hexToBytes,
   http,
   keccak256,
   serializeTransaction,
@@ -44,6 +45,10 @@ type Fee = { gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: strin
 type Reservation = { nonce: string };
 type Body = {
   chainId: string;
+  // Checksummed. Not serialised (the signature names the sender), but a nonce is a nonce of one
+  // sender: attachSignatures accepts only this sender's signature, so every attempt of a
+  // withdrawal is sent from the address whose nonce it reserved.
+  from: string;
   nonce: string;
   to: string;
   value: string;
@@ -67,9 +72,10 @@ function toSerializable(body: Body): TransactionSerializableEIP1559 {
   };
 }
 
+const digestOf = (body: Body): Hex => keccak256(serializeTransaction(toSerializable(body)));
+
 function unsignedTx(body: Body): UnsignedTx {
-  const digest = keccak256(serializeTransaction(toSerializable(body)));
-  return { body, signingPayloads: [digest.slice(2)] }; // bare lower-case hex
+  return { body, signingPayloads: [digestOf(body).slice(2)] }; // bare lower-case hex
 }
 
 // The node's own error text. Anything that is not the node answering (an HTTP error, a
@@ -225,6 +231,7 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
       const { to, value, data } = call(intent);
       const body: Body = {
         chainId: String(LOCAL_CHAIN_ID),
+        from: getAddress(intent.from),
         nonce,
         to,
         value: value.toString(),
@@ -242,19 +249,47 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
         throw new Error(`expected 1 signature, got ${signatures.length}`);
       if (sig.length !== 65) throw new Error(`expected a 65-byte signature, got ${sig.length}`);
       // viem reads any non-zero value as 1, so a 27/28 signer would sign as another address
-      const yParity = sig[64]!;
-      if (yParity > 1) throw new Error(`recovery id must be 0 or 1, got ${yParity}`);
-      const raw = serializeTransaction(toSerializable(unsigned.body as Body), {
-        r: bytesToHex(sig.subarray(0, 32)),
-        s: bytesToHex(sig.subarray(32, 64)),
+      const recovery = sig[64]!;
+      if (recovery > 1) throw new Error(`recovery id must be 0 or 1, got ${recovery}`);
+      const body = unsigned.body as Body;
+      // The sender is recovered from the signature and the digest of the body itself, as on
+      // Bitcoin: another key, or a wrong recovery id, would send from another address with this
+      // nonce, a transaction that could confirm next to this withdrawal's other attempts.
+      let signature = secp256k1.Signature.fromBytes(sig.subarray(0, 64), 'compact');
+      const key = signature.addRecoveryBit(recovery).recoverPublicKey(hexToBytes(digestOf(body)));
+      const sender = publicKeyToAddress(bytesToHex(key.toBytes(false)));
+      if (sender !== body.from) throw new Error(`signed by ${sender}, not the sender ${body.from}`);
+      // the node takes only low-S; (r, n - s) with the other parity is the same signature
+      let yParity = recovery;
+      if (signature.hasHighS()) {
+        signature = new secp256k1.Signature(signature.r, secp256k1.Point.Fn.ORDER - signature.s);
+        yParity ^= 1;
+      }
+      const rs = signature.toBytes('compact');
+      const raw = serializeTransaction(toSerializable(body), {
+        r: bytesToHex(rs.subarray(0, 32)),
+        s: bytesToHex(rs.subarray(32, 64)),
         yParity,
       });
       return { txid: keccak256(raw), raw };
     },
 
-    // Same nonce and every other field, higher fees: at most one of the two can confirm.
+    // Same nonce and every other field, higher fees: at most one of the two can confirm. Built
+    // from the previous attempt, so a caller with another sender or another nonce is refused
+    // rather than given a transaction that does not replace anything.
     async buildReplacement(intent, reservation, previous) {
       const body = previous.unsigned.body as Body;
+      if (getAddress(intent.from) !== body.from) {
+        throw new Error(
+          `the sender ${intent.from} differs from the previous attempt's ${body.from}`,
+        );
+      }
+      const { nonce } = reservation as Reservation;
+      if (nonce !== body.nonce) {
+        throw new Error(
+          `the reservation (nonce ${nonce}) differs from the previous attempt's nonce ${body.nonce}`,
+        );
+      }
       const market = await client.estimateFeesPerGas();
       const fee: Fee = {
         gasLimit: body.gas,
@@ -301,9 +336,10 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
         const to = getAddress(tx.to);
         transfers.push({ txid: tx.hash, index: 0, to, asset: 'native', amount: tx.value });
       }
-      // viem returns tx.to, the log addresses and the decoded args.to in EIP-55 checksummed form,
-      // so they compare equal to AssetIds and addresses elsewhere in the kit.
-      // The size guard matters: an empty address filter would match every contract's logs.
+      // viem returns tx.to and the log addresses as the node spells them, lower-case on anvil, and
+      // decodes args.to checksummed; the getAddress calls (above for tx.to, below for the token)
+      // checksum the first two, so all compare equal to AssetIds and addresses elsewhere in the
+      // kit. The size guard matters: an empty address filter would match every contract's logs.
       const logs =
         tokens.size > 0
           ? await client.getContractEvents({

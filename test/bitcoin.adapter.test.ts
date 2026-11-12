@@ -5,29 +5,50 @@ import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToNumberBE, hexToBytes, numberToBytesBE } from '@noble/curves/utils.js';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createBitcoinAdapter } from '../src/adapters/bitcoin/adapter.js';
 import { createBitcoinDevnet, type BitcoinDevnet } from '../src/adapters/bitcoin/devnet.js';
-import { btcToSats } from '../src/adapters/bitcoin/rpc.js';
+import { RpcError, bitcoinRpc, btcToSats } from '../src/adapters/bitcoin/rpc.js';
 import { config } from '../src/config.js';
 import type { ChainAdapter, Json, UnsignedTx } from '../src/core/adapter.js';
 import { LocalSigner } from '../src/core/local-signer.js';
 import { MemoryInputStore } from '../src/core/memory-input-store.js';
 
-// A JSON-RPC server that answers every call with `results[method]` (null if absent).
-async function stubNode(results: Record<string, unknown>) {
+type Reply =
+  | { result: unknown }
+  | { error: { code: number; message: string }; status?: number }
+  | 'http500'
+  | 'hangup'
+  | 'silent';
+type Script = Record<string, Reply[]>; // per method, replies in order; the last one repeats
+
+// A JSON-RPC server that follows the current script (null for any method it does not name).
+async function stubNode(first: Script = {}) {
+  let script = first;
   const server = createServer((req, res) => {
     let body = '';
     req.on('data', (chunk: Buffer) => (body += chunk.toString()));
     req.on('end', () => {
       const { id, method } = JSON.parse(body) as { id: number; method: string };
+      const queue = script[method] ?? [];
+      const reply = (queue.length > 1 ? queue.shift() : queue[0]) ?? { result: null };
+      if (reply === 'silent') return; // never answers
+      if (reply === 'hangup') return void req.socket.destroy();
+      if (reply === 'http500') {
+        res.statusCode = 500;
+        return void res.end('upstream says no');
+      }
+      // `status` steers this server; it is not part of the JSON-RPC body
+      const { status, ...payload } = reply as { status?: number };
+      if (status) res.statusCode = status;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ jsonrpc: '2.0', id, result: results[method] ?? null }));
+      res.end(JSON.stringify({ jsonrpc: '2.0', id, ...payload }));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    play: (next: Script) => (script = next),
     close: () => {
       server.closeAllConnections();
       server.close();
@@ -35,9 +56,16 @@ async function stubNode(results: Record<string, unknown>) {
   };
 }
 
+// every call answered with `results[method]`
+const answers = (results: Record<string, unknown>): Script =>
+  Object.fromEntries(Object.entries(results).map(([m, result]) => [m, [{ result }]]));
+
+const regtest = { chain: 'regtest', blocks: 1 };
+const synced = { txindex: { synced: true, best_block_height: 1 } };
+
 describe('createBitcoinAdapter', () => {
   it('B1 refuses a node that is not regtest', async () => {
-    const mainnet = await stubNode({ getblockchaininfo: { chain: 'main', blocks: 1 } });
+    const mainnet = await stubNode(answers({ getblockchaininfo: { chain: 'main', blocks: 1 } }));
     try {
       await expect(
         createBitcoinAdapter({ rpcUrl: mainnet.url, auth: config.bitcoinRpcAuth }),
@@ -48,16 +76,14 @@ describe('createBitcoinAdapter', () => {
   });
 
   it('B11 refuses a node without a synced transaction index, and a fee rate that is not positive', async () => {
-    const regtest = { chain: 'regtest', blocks: 1 };
     const start = async (index: unknown, feeRate?: bigint) => {
-      const node = await stubNode({ getblockchaininfo: regtest, getindexinfo: index });
+      const node = await stubNode(answers({ getblockchaininfo: regtest, getindexinfo: index }));
       try {
         await createBitcoinAdapter({ rpcUrl: node.url, auth: config.bitcoinRpcAuth, feeRate });
       } finally {
         node.close();
       }
     };
-    const synced = { txindex: { synced: true, best_block_height: 1 } };
     await expect(start({})).rejects.toThrow(/-txindex=1/); // started without -txindex
     await expect(start({ txindex: { synced: false, best_block_height: 0 } })).rejects.toThrow(
       /synced transaction index/,
@@ -65,6 +91,88 @@ describe('createBitcoinAdapter', () => {
     await expect(start(synced, 0n)).rejects.toThrow(/fee rate must be above 0/);
     await expect(start(synced, -2n)).rejects.toThrow(/fee rate must be above 0/);
     await expect(start(synced)).resolves.toBeUndefined();
+  });
+});
+
+describe('Bitcoin RPC client against a stub node', () => {
+  it('B15 a non-2xx answer is a transport failure even with a JSON-RPC error body', async () => {
+    const node = await stubNode();
+    try {
+      const rpc = bitcoinRpc(node.url, config.bitcoinRpcAuth);
+      const failure = { error: { code: -28, message: 'Loading block index' } };
+      node.play({ getblockcount: [{ ...failure, status: 500 }] });
+      const thrown = await rpc.call('getblockcount').catch((e: unknown) => e);
+      expect(thrown).not.toBeInstanceOf(RpcError);
+      expect(thrown).toMatchObject({ message: 'bitcoind getblockcount: HTTP 500' });
+      // control: the same error with HTTP 200 is the node's answer
+      node.play({ getblockcount: [failure] });
+      await expect(rpc.call('getblockcount')).rejects.toEqual(
+        new RpcError(-28, 'Loading block index'),
+      );
+    } finally {
+      node.close();
+    }
+  });
+
+  it('B16 a call the node does not answer in time names its method', async () => {
+    const node = await stubNode({ getblockcount: ['silent'] });
+    try {
+      const rpc = bitcoinRpc(node.url, config.bitcoinRpcAuth, 100);
+      await expect(rpc.call('getblockcount')).rejects.toThrow(
+        'bitcoind getblockcount: no answer within 0.1 s',
+      );
+    } finally {
+      node.close();
+    }
+  });
+});
+
+describe('Bitcoin adapter against a stub node', () => {
+  let node: Awaited<ReturnType<typeof stubNode>>;
+  let adapter: ChainAdapter;
+  const TXID = 'ab'.repeat(32);
+  const send = () => adapter.broadcast({ txid: TXID, raw: '02' + 'cd'.repeat(40) });
+  const unknown: Reply = {
+    error: { code: -5, message: 'No such mempool or blockchain transaction' },
+  };
+  const spent: Reply = { error: { code: -25, message: 'bad-txns-inputs-missingorspent' } };
+
+  beforeAll(async () => {
+    node = await stubNode(answers({ getblockchaininfo: regtest, getindexinfo: synced }));
+    adapter = await createBitcoinAdapter({ rpcUrl: node.url, auth: config.bitcoinRpcAuth });
+  });
+  afterAll(() => node.close());
+  // the replies the adapter needed to start, plus the broadcast's own
+  const play = (script: Script) =>
+    node.play({ ...answers({ getblockchaininfo: regtest, getindexinfo: synced }), ...script });
+
+  it('B17 broadcast throws on a transport failure instead of classifying it', async () => {
+    for (const failure of ['http500', 'hangup', { ...spent, status: 500 }] as Reply[]) {
+      play({ getrawtransaction: [unknown], sendrawtransaction: [failure] });
+      const thrown = await send().catch((e: unknown) => e);
+      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).not.toBeInstanceOf(RpcError);
+    }
+    // control: the node's own answer is classified, here as rejected
+    play({ getrawtransaction: [unknown], sendrawtransaction: [spent] });
+    expect(await send()).toEqual({ outcome: 'rejected', reason: spent.error.message });
+  });
+
+  it('B18 broadcast throws when the lookup after a send error fails in transport', async () => {
+    play({ getrawtransaction: [unknown, 'hangup'], sendrawtransaction: [spent] });
+    await expect(send()).rejects.toThrow(/fetch failed/);
+    // control: the lookup finds it in the mempool
+    play({ getrawtransaction: [unknown, { result: { txid: TXID } }], sendrawtransaction: [spent] });
+    expect(await send()).toEqual({ outcome: 'already_known' });
+  });
+
+  it('B19 broadcast throws when the node reports another txid than the local one', async () => {
+    play({ getrawtransaction: [unknown], sendrawtransaction: [{ result: 'ef'.repeat(32) }] });
+    await expect(send()).rejects.toThrow(
+      `node reports txid ${'ef'.repeat(32)} for local txid ${TXID}`,
+    );
+    play({ getrawtransaction: [unknown], sendrawtransaction: [{ result: TXID }] });
+    expect(await send()).toEqual({ outcome: 'accepted' });
   });
 });
 

@@ -1,6 +1,7 @@
 // The results table, and docs/results.md around it. scripts/fault-run.ts writes that file from a
 // passing run; nobody edits it by hand.
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import type { Graded } from './scenarios.js';
 
 export const RESULTS_PATH = 'docs/results.md';
@@ -74,18 +75,26 @@ export function table(outcomes: Outcome[], totals: Totals | null): string {
   return [line(header), rule, ...rows.map(line)].join('\n') + '\n';
 }
 
-/** `abc1234`, plus ` (dirty)` if anything but the results file itself differs from HEAD. */
-export function commitOf(root: string): string {
+export interface Checkout {
+  commit: string; // `abc1234`, plus ` (dirty)` if anything but the results file differs from HEAD
+  fingerprint: string; // changes with HEAD and with any change to the checkout but that file
+}
+
+export function checkoutOf(root: string): Checkout {
   const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
   const head = git('rev-parse', '--short', 'HEAD').trim();
   const changed = git('status', '--porcelain')
     .split('\n')
     .filter((l) => l.trim() !== '' && l.slice(3) !== RESULTS_PATH);
-  return `\`${head}\`${changed.length > 0 ? ' (dirty)' : ''}`;
+  const diff = git('diff', 'HEAD', '--', '.', `:!${RESULTS_PATH}`);
+  const fingerprint = createHash('sha256')
+    .update([git('rev-parse', 'HEAD'), ...changed, diff].join('\n'))
+    .digest('hex');
+  return { commit: `\`${head}\`${changed.length > 0 ? ' (dirty)' : ''}`, fingerprint };
 }
 
 export interface RunInfo {
-  commit: string; // from commitOf
+  commit: string; // from checkoutOf
   date: string;
   chain: string; // the chain and its node's version
   postgres: string;
@@ -141,7 +150,7 @@ worker processes (\`scripts/worker-main.ts\`) doing the work. Each \`kill at\` s
 worker at a time with that crash point switched on: every withdrawal kills the worker there once,
 and the next worker carries on from what was committed.
 
-${outcomes.map((o) => `- **${o.title}**: ${o.about}`).join('\n')}
+${outcomes.map((o) => `- **${o.title}**: ${o.about}${o.graded?.note ? ` This run: ${o.graded.note}.` : ''}`).join('\n')}
 
 ## What the columns mean
 

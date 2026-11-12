@@ -1,6 +1,8 @@
-// A tour of the pipeline on the local devnet in about 30 seconds: a small withdrawal, one that needs
+// A tour of the pipeline on the local devnet in a few seconds: a small withdrawal, one that needs
 // two approvals, a worker process killed between the broadcast and the record of it, a replayed
 // request, and the reconciliation. All of it in a fresh schema, dropped at the end unless --keep.
+// Each claim it prints about the crash, the replay and the balances is checked first: if one does
+// not hold, the demo says which and exits 1.
 //
 //   npx tsx scripts/demo.ts [--keep]
 import { closeSync, openSync, rmSync } from 'node:fs';
@@ -8,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
+import { must } from '../src/config.js';
 import { startMiner } from '../src/conformance/harness.js';
 import { noCrash } from '../src/pipeline/crash.js';
 import type { AssetPolicy } from '../src/pipeline/policy.js';
@@ -15,6 +18,7 @@ import { formatReport, reconcile } from '../src/pipeline/reconcile.js';
 import {
   decideApproval,
   getWithdrawal,
+  IdempotencyKeyReuse,
   submitWithdrawal,
   type RequestDeps,
   type Withdrawal,
@@ -158,8 +162,10 @@ try {
   const signal = await byDeadline(Date.now() + 30_000, Date.now(), exit);
   if (signal !== 'SIGKILL') throw new Error(`the worker ended by ${signal}, not SIGKILL`);
   const killed = await getWithdrawal(box.db, third.id);
+  must(killed.state === 'SIGNED', `after the kill the withdrawal is ${killed.state}, not SIGNED`);
   const txid = (await latestTxid(third.id)) ?? '';
   const status = await adapter.getTxStatus(txid);
+  must(status.state !== 'unknown', `the node does not know the transaction ${txid}`);
   console.log(`   the worker was killed (SIGKILL) right after the node accepted the transaction`);
   console.log(`   the row says ${killed.state}: nothing recorded the broadcast`);
   console.log(`   the chain already has ${short(txid)} (${status.state})`);
@@ -171,9 +177,16 @@ try {
   } finally {
     await stopMiner();
   }
-  console.log(`   ${(await getWithdrawal(box.db, third.id)).state}; its events:`);
+  const done = await getWithdrawal(box.db, third.id);
+  must(done.state === 'SETTLED', `the crashed withdrawal ended ${done.state}, not SETTLED`);
   const events = await box.db<{ kind: string; data: Record<string, unknown> }[]>`
     select kind, data from withdrawal_events where withdrawal_id = ${third.id} order by id`;
+  const broadcasts = events.filter((e) => e.kind === 'broadcast');
+  must(
+    broadcasts.length === 1 && broadcasts[0]?.data.sent === false,
+    `the restarted worker sent the transaction again: ${JSON.stringify(broadcasts.map((b) => b.data))}`,
+  );
+  console.log(`   ${done.state}; its events:`);
   for (const e of events) {
     if (e.kind === 'state') console.log(`     ${String(e.data.from)} -> ${String(e.data.to)}`);
     else console.log(`     ${e.kind.padEnd(15)} ${JSON.stringify(e.data, shortTxid)}`);
@@ -184,12 +197,13 @@ try {
 
   console.log(`\n5. The first request again, with the same idempotency key`);
   const replay = await submitWithdrawal(box.db, requests, firstRequest);
-  const same = replay.id === small.id ? 'the same withdrawal' : 'A DIFFERENT WITHDRAWAL';
-  console.log(`   returned ${replay.id}: ${same}, ${replay.state}; nothing new was created`);
-  await submitWithdrawal(box.db, requests, { ...firstRequest, amount: 2n * unit }).catch(
-    (e: unknown) =>
-      console.log(`   the same key for another amount is refused: ${(e as Error).message}`),
-  );
+  must(replay.id === small.id, `the replay returned ${replay.id}, not ${small.id}`);
+  console.log(`   returned ${replay.id}: the same withdrawal, ${replay.state}; nothing new`);
+  const reuse = await submitWithdrawal(box.db, requests, { ...firstRequest, amount: 2n * unit })
+    .then(() => null)
+    .catch((e: unknown) => e);
+  must(reuse instanceof IdempotencyKeyReuse, `the key reused for another amount was not refused`);
+  console.log(`   the same key for another amount is refused: ${reuse.message}`);
 
   console.log(`\n6. Reconciliation: the ledger against the chain`);
   const report = await reconcile(box.db, box.chains, { [env.chain]: env.assets });
@@ -200,12 +214,13 @@ try {
       .map((l) => (l ? `   ${l}` : l))
       .join('\n'),
   );
+  must(report.ok, 'the reconciliation failed');
   console.log(`\n   destination balances on the chain:`);
   for (const w of [small, big, third]) {
     const held = await adapter.getBalance(w.to, 'native');
+    must(held === w.amount, `${w.to} holds ${held}, not the ${w.amount} asked`);
     console.log(`     ${w.to}  ${units(held)} (asked ${units(w.amount)})`);
   }
-  failed = !report.ok;
 } catch (error) {
   failed = true;
   console.error(`\ndemo failed: ${error instanceof Error ? error.message : String(error)}`);

@@ -80,7 +80,7 @@ describe('fault run', () => {
       await stopMiner();
     }
 
-    expect(supervised).toEqual({ kills: 2, timedOut: false });
+    expect(supervised).toEqual({ kills: 2, killsMidHandler: 0, timedOut: false });
     const injected = await crashEvents(box.db);
     expect(injected.map((e) => e.point)).toEqual(['after_broadcast', 'after_broadcast']);
     expect(new Set(injected.map((e) => e.withdrawal_id))).toEqual(new Set(ws.map((w) => w.id)));
@@ -255,7 +255,13 @@ describe('fault-run script', () => {
 
       const out = JSON.parse(stdout) as {
         passed: boolean;
-        scenarios: { name: string; kills: number; withdrawals: number; rejected: number }[];
+        scenarios: {
+          name: string;
+          kills: number;
+          killsMidHandler: number;
+          withdrawals: number;
+          rejected: number;
+        }[];
         totals: Record<string, number | string> | null;
       };
       expect(out.passed).toBe(true);
@@ -263,7 +269,8 @@ describe('fault-run script', () => {
       expect(out.totals).toMatchObject({ sentTwice: 0, lost: 0, unfinished: 0, drift: '0' });
       const [randomKills, duplicates] = out.scenarios;
       expect(randomKills?.kills).toBeGreaterThan(0);
-      expect(randomKills?.withdrawals).toBe(10);
+      expect(randomKills?.killsMidHandler).toBeGreaterThan(0); // a kill interrupted a handler
+      expect(randomKills?.withdrawals).toBe(40);
       expect(duplicates?.rejected).toBe(2); // one not allowlisted, one over the limit
     },
   );

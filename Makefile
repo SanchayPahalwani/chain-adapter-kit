@@ -25,17 +25,19 @@ conformance: node_modules
 	npx vitest run test/*.conformance.test.ts
 
 # The full fault matrix (scripts/lib/scenarios.ts), graded by the chain; writes docs/results.md
-# when every scenario passes.
+# when every scenario passes and the checkout did not change during the run.
 faults: node_modules
 	npx tsx scripts/fault-run.ts
 
-# A 30-second tour on a fresh schema: brings the containers up first.
+# A short tour on a fresh schema: brings the containers up first. No migrate: the demo creates and
+# migrates its own schema, and drops it at the end.
 demo: node_modules up
 	npx tsx scripts/demo.ts
 
 # Reconciles the ledger against the chain, configured by the environment (KIT_SEED, KIT_DB_SCHEMA,
-# KIT_CHAINS, DATABASE_URL and the chain's own variables), which make passes through.
-reconcile: node_modules
+# KIT_CHAINS, DATABASE_URL and the chain's own variables), which make passes through. Migrates the
+# default schema first, which is the one it reads without KIT_DB_SCHEMA.
+reconcile: node_modules migrate
 	npx tsx scripts/reconcile.ts
 
 # Compiles contracts/TestToken.sol with forge inside the Foundry image (solc version from the

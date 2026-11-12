@@ -1,15 +1,18 @@
 // Runs the fault-injection scenarios (scripts/lib/scenarios.ts) one after another, each on its own
 // sandbox, and grades every withdrawal by what its destination holds on the chain (spec section
-// 11). One line per scenario, then the table; docs/results.md is written only when every scenario
-// passed. Exit code 1 if any failed, 130 if interrupted.
+// 11). One line per scenario, then the table. docs/results.md is written only by the full matrix
+// at default counts (no --quick, --only or --per-scenario), only when every scenario passed, and
+// only if the checkout did not change during the run. Exit code 1 if any failed or the file could
+// not be written, 130 if interrupted.
 //
 //   npx tsx scripts/fault-run.ts [--quick | --per-scenario <n>] [--only <name>,...] [--keep]
 //                                [--json] [--no-write]
 //
-// --quick: 2 withdrawals per scenario (default 10), and 10 for random_kills (default 100).
+// --quick: 2 withdrawals per scenario (default 10), and 40 for random_kills (default 100).
 // --only: scenario names: a crash point, random_kills, duplicate_requests, dropped_tx, reorg,
 // stuck_fee. --keep: keep each scenario's schema and log. --json: the results as one JSON document
-// on stdout, and nothing else there. --no-write: leave docs/results.md as it is.
+// on stdout, and nothing else there. --no-write: leave docs/results.md as it is (as any partial
+// run does).
 import { closeSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +21,7 @@ import { config } from '../src/config.js';
 import { connect } from '../src/pipeline/db.js';
 import { makeEvmEnv } from './lib/evm-env.js';
 import {
-  commitOf,
+  checkoutOf,
   RESULTS_PATH,
   resultsMarkdown,
   table,
@@ -58,6 +61,8 @@ for (const name of only ?? []) {
   if (!scenarios.some((s) => s.name === name)) usage(`unknown scenario ${name}`);
 }
 const selected = only ? scenarios.filter((s) => only.includes(s.name)) : scenarios;
+// docs/results.md describes the whole matrix at its default counts, and nothing else
+const partial = args.quick || only !== undefined || args['per-scenario'] !== undefined;
 // with --json, stdout carries the JSON document only
 const say = args.json ? console.error : console.log;
 
@@ -81,7 +86,7 @@ process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
 const started = Date.now();
-const commit = commitOf(root);
+const checkout = checkoutOf(root);
 const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const env = await makeEvmEnv();
 
@@ -90,7 +95,8 @@ const line = (title: string, g: Graded) => {
   return (
     `${g.problems.length > 0 ? 'FAILED: ' : ''}${title}: ${v.withdrawals} withdrawals, ` +
     `${g.kills} kills, ${v.settled} settled, ${v.rejected} rejected, sent twice ${v.sentTwice}, ` +
-    `lost ${v.lost}, unfinished ${v.unfinished}, drift ${g.drift}`
+    `lost ${v.lost}, unfinished ${v.unfinished}, drift ${g.drift}` +
+    (g.note ? `; ${g.note}` : '')
   );
 };
 
@@ -163,7 +169,9 @@ async function report() {
               finished: true,
               ...g.verdict,
               kills: g.kills,
+              killsMidHandler: g.killsMidHandler,
               drift: g.drift,
+              note: g.note,
               problems: g.problems,
             }
           : { name, title, finished: false, error },
@@ -179,28 +187,45 @@ async function report() {
   if (failures > 0) {
     if (!args['no-write']) console.error(`${RESULTS_PATH} not written: the run failed`);
     process.exitCode = 1;
-  } else if (!args['no-write'] && totals) {
-    const db = connect(config.databaseUrl);
-    let postgres = 'unknown';
-    try {
-      const [row] = await db<{ server_version: string }[]>`show server_version`;
-      postgres = row?.server_version ?? postgres;
-    } finally {
-      await db.end();
-    }
-    const script = relative(root, fileURLToPath(import.meta.url));
-    const info = {
-      commit,
-      date,
-      chain: `${env.chain} (${env.nodeVersion})`,
-      postgres,
-      node: process.version,
-      command: ['npx tsx', script, ...process.argv.slice(2)].join(' '),
-      seconds: seconds(started),
-    };
-    writeFileSync(join(root, RESULTS_PATH), resultsMarkdown(info, outcomes, totals));
-    say(`wrote ${RESULTS_PATH}`);
+    return;
   }
+  if (args['no-write'] || !totals) return;
+  if (partial) {
+    console.error(`${RESULTS_PATH} not written: only the full matrix at default counts writes it`);
+    return;
+  }
+  // The workers load the code at each start, so a checkout changed during the run (another
+  // process editing or committing) means the file could not say which code it describes.
+  const now = checkoutOf(root);
+  if (now.fingerprint !== checkout.fingerprint) {
+    const how =
+      now.commit === checkout.commit
+        ? `files changed, still ${now.commit}`
+        : `${checkout.commit} at the start, ${now.commit} now`;
+    console.error(`${RESULTS_PATH} not written: the checkout changed during the run (${how})`);
+    process.exitCode = 1;
+    return;
+  }
+  const db = connect(config.databaseUrl);
+  let postgres = 'unknown';
+  try {
+    const [row] = await db<{ server_version: string }[]>`show server_version`;
+    postgres = row?.server_version ?? postgres;
+  } finally {
+    await db.end();
+  }
+  const script = relative(root, fileURLToPath(import.meta.url));
+  const info = {
+    commit: checkout.commit,
+    date,
+    chain: `${env.chain} (${env.nodeVersion})`,
+    postgres,
+    node: process.version,
+    command: ['npx tsx', script, ...process.argv.slice(2)].join(' '),
+    seconds: seconds(started),
+  };
+  writeFileSync(join(root, RESULTS_PATH), resultsMarkdown(info, outcomes, totals));
+  say(`wrote ${RESULTS_PATH}`);
 }
 
 await runAll();

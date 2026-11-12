@@ -53,9 +53,11 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
     async makeStuck() {
       stuck = true;
-      // Takes effect at the next mined block. Quotes read the latest block's base fee, so they
-      // rise only after that block. anvil evicts a pending transaction priced below a mined
-      // block's base fee rather than holding it, so earlier quotes leave the pool, not confirm.
+      // The raised base fee applies from the next mined block on (mine() sets it again before
+      // each block). When that block is mined, anvil evicts every pending transaction priced
+      // below it rather than holding it: those leave the pool unconfirmed. From now on anvil also
+      // refuses, at send, a transaction priced below the next block's base fee. Quotes read the
+      // latest block's base fee, so they rise only once that block is mined.
       await base.setNextBaseFee(STUCK_BASE_FEE);
     },
     async clearStuck() {

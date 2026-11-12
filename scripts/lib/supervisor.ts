@@ -34,12 +34,21 @@ export function spawnWorker(run: Run, opts: WorkerOptions): ChildProcess {
   };
   if (opts.crashAt) env.KIT_CRASH_AT = opts.crashAt;
   else delete env.KIT_CRASH_AT;
+  delete env.KIT_WORKER_ID; // so each worker's id, its lease_owner, is its own pid
   // 'ipc': if this process dies, the channel closes and the worker stops itself (worker-main.ts)
   return spawn(process.execPath, ['--import', 'tsx', workerMain], {
     cwd: root,
     env,
     stdio: ['ignore', run.logFd, run.logFd, 'ipc'],
   });
+}
+
+// A worker killed while it held a withdrawal's lease (between claim and release) was killed
+// mid-handler: a dead worker cannot release, so its lease is still there.
+async function heldLease(db: Db, child: ChildProcess): Promise<boolean> {
+  const [row] = await db<{ n: number }[]>`
+    select count(*)::int as n from withdrawals where lease_owner = ${String(child.pid)}`;
+  return (row?.n ?? 0) > 0;
 }
 
 async function unfinished(db: Db): Promise<number> {
@@ -71,6 +80,7 @@ async function stop(child: ChildProcess, exit: Promise<Exit>): Promise<Exit> {
 export interface Supervised {
   // workers that died by SIGKILL: from a crash hook (opts.crashAt), or sent here (killEveryMs)
   kills: number;
+  killsMidHandler: number; // kills sent here that left a withdrawal leased to the dead worker
   timedOut: boolean; // the deadline passed before the stop condition held
 }
 
@@ -104,6 +114,7 @@ export async function supervise(
     killEveryMs ? killEveryMs[0] + Math.random() * (killEveryMs[1] - killEveryMs[0]) : Infinity;
   let nextKill = Date.now() + killGap();
   let kills = 0;
+  let killsMidHandler = 0;
 
   const account = (child: ChildProcess, [code, sig]: Exit, stopped: boolean) => {
     if (sig === 'SIGKILL' && (killedHere.has(child) || opts.crashAt)) {
@@ -123,7 +134,10 @@ export async function supervise(
         live.delete(child);
         account(child, await exit, false);
       }
-      if (signal?.aborted || Date.now() >= deadline || (await done())) {
+      // whether `until` held when stopping was decided: a condition such as "every withdrawal
+      // is BROADCAST" need not hold any more once the workers have stopped
+      const held = !signal?.aborted && (await done());
+      if (signal?.aborted || held || Date.now() >= deadline) {
         const stopping = [...live];
         live.clear();
         const exits = await Promise.allSettled(stopping.map(([child, exit]) => stop(child, exit)));
@@ -133,7 +147,7 @@ export async function supervise(
           if (child) account(child, e.value, true);
         });
         if (signal?.aborted) throw new Error('interrupted');
-        return { kills, timedOut: !(await done()) };
+        return { kills, killsMidHandler, timedOut: !held && !(await done()) };
       }
       while (live.size < workers) {
         const child = spawnWorker(run, opts);
@@ -146,6 +160,8 @@ export async function supervise(
         if (victim) {
           killedHere.add(victim);
           victim.kill('SIGKILL');
+          await live.get(victim); // dead, so a lease still in its name is one it died holding
+          if (await heldLease(run.box.db, victim)) killsMidHandler++;
         }
         nextKill = Date.now() + killGap();
       }

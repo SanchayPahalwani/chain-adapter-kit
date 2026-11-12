@@ -77,6 +77,13 @@ describe('withdrawal pipeline on EVM', () => {
       expect(await balance(p.db, acct.networkFees(n))).toBe(status.feePaid);
       expect(await env.adapter.getBalance(w.to, token)).toBe(0n);
       expect((await eventsOf(p.db, w.id)).at(-1)).toBe('BROADCAST>FAILED');
+      // burnToken sent from the dev account: the hot wallet sent only this withdrawal
+      const client = createPublicClient({ transport: http(config.evmRpcUrl), cacheTime: 0 });
+      const sent = await client.getTransactionCount({
+        address: p.hot.hotAddress as Address,
+        blockTag: 'latest',
+      });
+      expect(sent).toBe(1);
     } finally {
       await p.close();
     }

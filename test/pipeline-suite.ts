@@ -38,6 +38,9 @@ export interface PipelineEnv {
   // raise the fee level and keep it raised across blocks:
   // transactions quoted before this no longer confirm, later quotes do
   makeStuck(): Promise<void>;
+  // true: a transaction priced below the raised level leaves the pool (is evicted) rather than
+  // waiting in it, so re-sending it is rejected until a replacement gets through
+  stuckEvicts: boolean;
   clearStuck(): Promise<void>; // back to the normal fee level
 }
 
@@ -235,6 +238,13 @@ function withMethods(
   return { ...deps, chains: { ...deps.chains, [env.chain]: { ...rt, adapter } } };
 }
 
+/** `sent` and `outcome` of a withdrawal's `broadcast` events, in order. */
+async function broadcastEvents(db: Db, id: string) {
+  return db<{ sent: boolean; outcome: string }[]>`
+    select (data->>'sent')::boolean as sent, data->>'outcome' as outcome from withdrawal_events
+     where withdrawal_id = ${id} and kind = 'broadcast' order by id`;
+}
+
 /** The kinds of a withdrawal's events in order; a state change reads `FROM>TO`. */
 export async function eventsOf(db: Db, id: string): Promise<string[]> {
   const rows = await db<{ kind: string; data: { from?: string; to?: string } }[]>`
@@ -297,8 +307,11 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       p = await openPipeline(env);
     });
     afterEach(async () => {
-      await p.close();
-      await env.clearStuck();
+      try {
+        await p.close();
+      } finally {
+        await env.clearStuck();
+      }
     });
 
     it('P1 a native withdrawal settles and the ledger matches the chain', async () => {
@@ -383,6 +396,7 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
         'SIGNED>BROADCAST',
         'BROADCAST>SETTLED',
       ]);
+      expect(await broadcastEvents(p.db, w.id)).toEqual([{ sent: true, outcome: 'accepted' }]);
     });
 
     it('P4 three workers, twelve withdrawals: all settle, each destination receives exactly once', async () => {
@@ -501,6 +515,9 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       await runOnce(deps, 'two');
       expect(await state(w.id)).toBe('BROADCAST');
       expect(spy).not.toHaveBeenCalled();
+      expect(await broadcastEvents(p.db, w.id)).toEqual([
+        { sent: false, outcome: 'already_known' },
+      ]);
 
       await drive(deps, env, terminal(p.db, w.id));
       expect(spy).not.toHaveBeenCalled();
@@ -590,7 +607,13 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(done.settledTxid).toBe(two?.txid);
       expect(two?.fee).not.toEqual(one?.fee); // quoted again, at the raised level
       expect((await env.adapter.getTxStatus(first.txid)).state).not.toBe('confirmed');
-      expect(await eventsOf(p.db, w.id)).toContain('replacement');
+      expect(await eventsOf(p.db, w.id)).not.toContain('rebroadcast');
+      const [replaced] = await p.db<{ data: { rejected: string | null } }[]>`
+        select data from withdrawal_events where withdrawal_id = ${w.id} and kind = 'replacement'`;
+      // An evicted attempt is unknown, its re-send is rejected, and that run replaces it. One
+      // that waits in the pool is pending: no re-send, so no rejection.
+      if (env.stuckEvicts) expect(replaced?.data.rejected).toBeTruthy();
+      else expect(replaced?.data.rejected).toBeNull();
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
     });
 
@@ -616,8 +639,10 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
     });
 
     it('F5 an underfunded hot wallet delays the withdrawal, it does not fail it', async () => {
-      await p.close();
+      // the new pipeline is assigned before the old one closes, so afterEach always closes one
+      const old = p;
       p = await openPipeline(env, { fundOnChain: false });
+      await old.close();
       const amount = env.unit(native);
       await p.credit(native, amount);
       const w = await p.withdraw(native, amount);
@@ -637,6 +662,40 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       await drive(p.deps, env, terminal(p.db, w.id));
       expect(await state(w.id)).toBe('SETTLED');
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it('an attempt whose txid another withdrawal already stored is an error, not a lost race', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, 2n * amount);
+      const a = await p.withdraw(native, amount);
+      await drive(p.deps, env, terminal(p.db, a.id)); // settled, so the worker never claims it
+      const [taken] = await attemptsOf(p.db, a.id);
+      if (!taken) throw new Error('no attempt');
+      const b = await p.withdraw(native, amount);
+      await runOnce(p.deps, 'one');
+      expect(await state(b.id)).toBe('RESERVED');
+      // what a shared reservation would produce: byte-identical bytes, so the same txid
+      const deps = withMethods(p.deps, env, {
+        attachSignatures: () => ({ txid: taken.txid, raw: taken.raw }),
+      });
+
+      const thrown = await handlers
+        .RESERVED(deps, await getWithdrawal(p.db, b.id))
+        .catch((e: unknown) => e);
+      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).not.toBeInstanceOf(LostRace);
+
+      expect(await runOnce(deps, 'one')).toBe(true);
+      const [row] = await p.db<
+        { state: string; error_count: number; last_error: string | null; later: boolean }[]
+      >`
+        select state, error_count, last_error, next_run_at > now() as later
+          from withdrawals where id = ${b.id}`;
+      expect(row?.state).toBe('RESERVED');
+      expect(row?.error_count).toBe(1);
+      expect(row?.last_error).toMatch(/duplicate key/);
+      expect(row?.later).toBe(true); // backed off, not re-claimed at once
+      expect(await attemptsOf(p.db, b.id)).toHaveLength(0);
     });
 
     it('F6 attempts stop at maxAttempts', async () => {

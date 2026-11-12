@@ -41,6 +41,7 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
     freshAddress: async () =>
       adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
+    stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
     async makeStuck() {
       stuck = true;
       // Takes effect at the next mined block. Quotes read the latest block's base fee, so they

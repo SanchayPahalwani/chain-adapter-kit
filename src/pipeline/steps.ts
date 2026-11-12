@@ -94,15 +94,15 @@ async function signTx(deps: WorkerDeps, rt: ChainRuntime, unsigned: UnsignedTx):
 }
 
 // The whole unsigned transaction is stored, so a replacement can be built from it later.
-// `on conflict do nothing`: a unique attempt_no or txid already there means another worker
-// stored this attempt first.
+// An attempt_no already there means another worker stored this attempt first: LostRace. A txid
+// already there is not targeted, so it fails loudly: it means two attempts share their bytes.
 async function storeAttempt(tx: Tx, id: string, no: number, signed: SignedTx, built: Built) {
   const { body, signingPayloads } = built.unsigned;
   const unsigned = tx.json({ body, signingPayloads });
   const rows = await tx`
     insert into tx_attempts (withdrawal_id, attempt_no, txid, raw, unsigned, fee)
     values (${id}, ${no}, ${signed.txid}, ${signed.raw}, ${unsigned}, ${tx.json(built.fee)})
-    on conflict do nothing`;
+    on conflict (withdrawal_id, attempt_no) do nothing`;
   if (rows.count === 0) throw new LostRace(`attempt ${no} of withdrawal ${id} is already stored`);
 }
 
@@ -224,7 +224,11 @@ async function track(deps: WorkerDeps, w: Withdrawal): Promise<void> {
     }
     if (result.outcome === 'rejected') rejected = result.reason;
   }
-  if (latest.stale && seen.length < deps.timings.maxAttempts && (await replace(deps, w, latest))) {
+  if (
+    latest.stale &&
+    seen.length < deps.timings.maxAttempts &&
+    (await replace(deps, w, latest, rejected))
+  ) {
     return;
   }
   await poll(deps, w, rejected);
@@ -239,9 +243,10 @@ async function poll(deps: WorkerDeps, w: Withdrawal, rejected: string | null = n
      where id = ${w.id} and state = 'BROADCAST'`;
 }
 
-// Stored before it is sent: the state goes back to SIGNED, and the broadcast handler sends it
-// exactly as it sends a first attempt. Same reservation, so at most one attempt can confirm.
-async function replace(deps: WorkerDeps, w: Withdrawal, latest: Attempt): Promise<boolean> {
+// Stored before it is sent: back to SIGNED, and the broadcast handler sends it as it sends a first
+// attempt. Same reservation, so at most one attempt can confirm. `rejected` (this run's re-send
+// of `latest`) goes in the event, since no poll follows to record it.
+async function replace(deps: WorkerDeps, w: Withdrawal, latest: Attempt, rejected: string | null) {
   const rt = runtime(deps, w);
   const previous = { unsigned: latest.unsigned, fee: latest.fee };
   const rep = await rt.adapter.buildReplacement(intentOf(rt, w), w.reservation, previous);
@@ -250,7 +255,7 @@ async function replace(deps: WorkerDeps, w: Withdrawal, latest: Attempt): Promis
   await deps.db.begin(async (tx) => {
     await transition(tx, w.id, 'BROADCAST', 'SIGNED'); // first: see transition
     await storeAttempt(tx, w.id, latest.attempt_no + 1, signed, rep);
-    await event(tx, w.id, 'replacement', { txid: signed.txid, replaces: latest.txid });
+    await event(tx, w.id, 'replacement', { txid: signed.txid, replaces: latest.txid, rejected });
   });
   await deps.crash('after_replacement_store', w.id);
   return true;

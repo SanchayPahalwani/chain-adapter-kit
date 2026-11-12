@@ -13,7 +13,7 @@ export interface BitcoinAdapterOptions {
 }
 
 const chain = 'bitcoin-regtest';
-const REGTEST = { bech32: 'bcrt', pubKeyHash: 0x6f, scriptHash: 0xc4, wif: 0xef };
+export const REGTEST = { bech32: 'bcrt', pubKeyHash: 0x6f, scriptHash: 0xc4, wif: 0xef };
 // Signals that the transaction may be replaced (BIP-125); Core 32 replaces any transaction anyway.
 const SEQUENCE = 0xfffffffd;
 // The smallest P2WPKH output the node relays (dust rate 3 sat/vB). Smaller change would get the
@@ -31,6 +31,15 @@ interface Scan {
   success: boolean;
   total_amount: number;
   unspents: { txid: string; vout: number; amount: number }[];
+}
+
+interface Block {
+  previousblockhash?: string; // absent on the genesis block
+  tx: { txid: string; vout: { n: number; value: number; scriptPubKey: { address?: string } }[] }[];
+}
+
+function native(asset: string): void {
+  if (asset !== 'native') throw new Error(`unknown asset ${asset}`);
 }
 
 // Only the lower-case form, which deriveAddress returns and the node reports, so that one address
@@ -66,9 +75,13 @@ function digests(tx: Transaction, from: string, amounts: bigint[]): Uint8Array[]
   return amounts.map((amount, i) => tx.preimageWitnessV0(i, code, SigHash.ALL, amount));
 }
 
-// Spends every coin: `amount` to `intent.to`, `fee` to the miner, and the rest back to the sender,
-// unless it is below dust, when it goes to the fee too.
-function assemble(intent: TransferIntent, coins: Reservation['coins'], fee: bigint): UnsignedTx {
+// Spends every coin: `amount` to `intent.to`, the fee at `rate` sat/vB to the miner, and the rest
+// back to the sender, unless it is below dust, when it goes to the fee too. buildTransfer and
+// buildReplacement both build here, so a replacement differs from the original only in the change.
+function assemble(intent: TransferIntent, coins: Reservation['coins'], rate: bigint): UnsignedTx {
+  native(intent.asset);
+  if (!isP2wpkh(intent.to)) throw new Error(`not a regtest P2WPKH address: ${intent.to}`);
+  const fee = feeFor(coins.length, 2, rate);
   const tx = new Transaction({ version: 2, lockTime: 0 });
   for (const { id } of coins) {
     const [txid, vout] = id.split(':');
@@ -104,10 +117,6 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   }
   const feeRate = opts.feeRate ?? 2n;
   if (feeRate <= 0n) throw new Error(`fee rate must be above 0 sat/vB, got ${feeRate}`);
-
-  function native(asset: string): void {
-    if (asset !== 'native') throw new Error(`unknown asset ${asset}`);
-  }
 
   // The node scans the UTXO set for one caller at a time and answers -8 to any other (this
   // adapter or another client), so wait up to 5 s for that scan to finish.
@@ -231,10 +240,7 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
 
     // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
     async buildTransfer(intent, reservation, fee) {
-      native(intent.asset);
-      if (!isP2wpkh(intent.to)) throw new Error(`not a regtest P2WPKH address: ${intent.to}`);
-      const { coins } = reservation as Reservation;
-      return assemble(intent, coins, feeFor(coins.length, 2, BigInt((fee as Fee).feeRate)));
+      return assemble(intent, (reservation as Reservation).coins, BigInt((fee as Fee).feeRate));
     },
 
     attachSignatures(unsigned, signatures) {
@@ -270,7 +276,27 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
       return { txid: tx.id, raw: bytesToHex(tx.extract()) };
     },
 
-    buildReplacement: () => Promise.reject(new Error('not implemented')),
+    // The same coins in the same order, so it conflicts with every earlier attempt and at most one
+    // confirms (BIP-125; Core 32 replaces any transaction). The same payment; the change pays the
+    // higher fee: at least an eighth and 1 sat/vB above the last rate, and what quoteFee asks now.
+    // That is more than the 0.1 sat/vB of its own size BIP-125 asks on top of the fee it replaces.
+    // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
+    async buildReplacement(intent, reservation, previous) {
+      const last = BigInt((previous.fee as Fee).feeRate);
+      const rate = [(last * 9n + 7n) / 8n, last + 1n, feeRate].reduce((a, b) => (a > b ? a : b));
+      const cannot = (why: string) =>
+        new Error(`cannot afford replacement at ${rate} sat/vB: ${why}`);
+      const { coins } = reservation as Reservation;
+      const held = coins.reduce((sum, c) => sum + BigInt(c.amount), 0n);
+      const fee = feeFor(coins.length, 2, rate);
+      if (held < intent.amount + fee)
+        throw cannot(`the coins hold ${held} sat, short of ${intent.amount} + ${fee}`);
+      const unsigned = assemble(intent, coins, rate);
+      // both without change: the same transaction again, which pays no more
+      if ((unsigned.body as Body).tx === (previous.unsigned.body as Body).tx)
+        throw cannot('the previous attempt already pays all its change as fee');
+      return { unsigned, fee: { feeRate: rate.toString() } satisfies Fee };
+    },
 
     async broadcast({ txid, raw }) {
       if (await nodeHas(txid)) return { outcome: 'already_known' };
@@ -292,6 +318,20 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
 
     getTxStatus,
 
-    scanBlock: () => Promise.reject(new Error('not implemented')),
+    // Every output that pays an address: the coinbase's too (the deposit scanner keeps the ones to
+    // its deposit addresses) and change back to the sender. Beyond the tip, getblockhash throws.
+    async scanBlock(height) {
+      const hash = await rpc.call<string>('getblockhash', [height]);
+      const block = await rpc.call<Block>('getblock', [hash, 2]); // 2: with every transaction
+      const transfers = block.tx.flatMap(({ txid, vout }) =>
+        vout.flatMap(({ n, value, scriptPubKey: { address: to } }) => {
+          const amount = btcToSats(value);
+          return to && amount > 0n ? [{ txid, index: n, to, asset: 'native', amount }] : [];
+        }),
+      );
+      // the genesis header holds 32 zero bytes where the parent's hash would be
+      const parentHash = block.previousblockhash ?? '0'.repeat(64);
+      return { block: { height, hash }, parentHash, transfers };
+    },
   };
 }

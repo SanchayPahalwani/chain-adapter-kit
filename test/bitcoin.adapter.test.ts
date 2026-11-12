@@ -8,6 +8,7 @@ import { bytesToNumberBE, hexToBytes, numberToBytesBE } from '@noble/curves/util
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createBitcoinAdapter } from '../src/adapters/bitcoin/adapter.js';
 import { createBitcoinDevnet, type BitcoinDevnet } from '../src/adapters/bitcoin/devnet.js';
+import { btcToSats } from '../src/adapters/bitcoin/rpc.js';
 import { config } from '../src/config.js';
 import type { ChainAdapter, Json, UnsignedTx } from '../src/core/adapter.js';
 import { LocalSigner } from '../src/core/local-signer.js';
@@ -108,6 +109,38 @@ describe('Bitcoin adapter against regtest', () => {
     return w;
   }
 
+  // a signed transfer of `amount` from the confirmed coins of `from`, not sent
+  async function prepare(from: { keyId: string; address: string }, to: string, amount: bigint) {
+    const intent = { from: from.address, to, asset: 'native', amount };
+    const fee = await adapter.quoteFee(intent);
+    const store = new MemoryInputStore();
+    await adapter.syncInputs(store, from.address);
+    const reservation = await adapter.reserveInputs(store, intent, fee);
+    const unsigned = await adapter.buildTransfer(intent, reservation, fee);
+    const signed = adapter.attachSignatures(unsigned, await sign(from.keyId, unsigned));
+    return { intent, fee, reservation, unsigned, signed };
+  }
+
+  // another transaction spending the coins of `tx`: the same payment to someone else
+  async function conflictOf(keyId: string, tx: Awaited<ReturnType<typeof prepare>>) {
+    const intent = { ...tx.intent, to: (await wallet()).address };
+    const unsigned = await adapter.buildTransfer(intent, tx.reservation, tx.fee);
+    return adapter.attachSignatures(unsigned, await sign(keyId, unsigned));
+  }
+
+  interface Decoded {
+    vin: { txid: string; vout: number; sequence: number }[];
+    vout: { value: number; n: number; scriptPubKey: { address?: string } }[];
+  }
+  const decode = (raw: string) => devnet.rpc.call<Decoded>('decoderawtransaction', [raw]);
+  const pooledFee = async (txid: string) => {
+    const entry = await devnet.rpc.call<{ vsize: number; fees: { base: number } }>(
+      'getmempoolentry',
+      [txid],
+    );
+    return { vsize: BigInt(entry.vsize), fee: btcToSats(entry.fees.base) };
+  };
+
   it('B2 syncInputs and getBalance survive a parallel scan', async () => {
     // the node runs one UTXO scan at a time and answers -8 to a second one
     const from = await wallet();
@@ -163,6 +196,77 @@ describe('Bitcoin adapter against regtest', () => {
     }
   });
 
+  it('B4 re-broadcast of a mined transaction whose outputs are spent is already_known, a real double spend is rejected', async () => {
+    // 1 input at 2 sat/vB: a fee of 282 sat leaves no change, so the payment is the only output
+    const from = await walletWith(100_000n);
+    const mid = await wallet();
+    const a = await prepare(from, mid.address, 100_000n - 282n);
+    expect(await outputs(a.signed.raw)).toEqual([mid.address]);
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+    const b = await prepare(mid, (await wallet()).address, 50_000n);
+    expect(await adapter.broadcast(b.signed)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+
+    // every output of `a` is spent: the node answers its bytes as it answers a double spend
+    expect(await devnet.rpc.call('gettxout', [a.signed.txid, 0])).toBeNull();
+    await expect(devnet.rpc.call('sendrawtransaction', [a.signed.raw])).rejects.toThrow(
+      /bad-txns-inputs-missingorspent/,
+    );
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'already_known' });
+    expect(await adapter.broadcast(await conflictOf(from.keyId, a))).toEqual({
+      outcome: 'rejected',
+      reason: expect.stringMatching(/bad-txns-inputs-missingorspent/) as string,
+    });
+  });
+
+  it('B5 a reorged-out and conflicted transaction is unknown, never confirmed with 0 confirmations', async () => {
+    const from = await walletWith(100_000n);
+    const a = await prepare(from, (await wallet()).address, 50_000n);
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+    const first = await adapter.getTxStatus(a.signed.txid);
+    if (first.state !== 'confirmed') throw new Error(`${a.signed.txid} is ${first.state}`);
+
+    await devnet.rpc.call('invalidateblock', [first.block.hash]);
+    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'pending' });
+    // the new block at that height spends the same coin to someone else
+    const conflict = await conflictOf(from.keyId, a);
+    await devnet.rpc.call('generateblock', [(await wallet()).address, [conflict.raw]]);
+
+    // the transaction index still serves `a`, with the block it left and 0 confirmations
+    const raw = await devnet.rpc.call('getrawtransaction', [a.signed.txid, true]);
+    expect(raw).toMatchObject({ blockhash: first.block.hash, confirmations: 0 });
+    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'unknown' });
+    expect(await adapter.getTxStatus(conflict.txid)).toMatchObject({
+      state: 'confirmed',
+      confirmations: 1,
+    });
+  });
+
+  it('B6 buildReplacement throws when the coins cannot pay the bumped fee', async () => {
+    const from = await wallet();
+    const to = (await wallet()).address;
+    // An invented coin of 100,000 sat (no chain needed). 1 input, 2 outputs: 141 vB, so the
+    // fee is 282 sat at 2 sat/vB and 423 sat at 3 sat/vB, the first bump.
+    const reservation: Json = { coins: [{ id: `${'cd'.repeat(32)}:0`, amount: '100000' }] };
+    const fee: Json = { feeRate: '2' };
+    const replace = async (change: bigint) => {
+      const intent = { from: from.address, to, asset: 'native', amount: 100_000n - 282n - change };
+      const unsigned = await adapter.buildTransfer(intent, reservation, fee);
+      return adapter.buildReplacement(intent, reservation, { unsigned, fee });
+    };
+    // 100 sat of change: 41 sat short of the bumped fee
+    await expect(replace(100n)).rejects.toThrow(
+      /cannot afford replacement at 3 sat\/vB: the coins hold 100000 sat/,
+    );
+    // 293 sat of change went to the fee already. The bump fits in it, but the rest is folded
+    // again: the same transaction, which pays no more.
+    await expect(replace(293n)).rejects.toThrow(/cannot afford replacement .* already pays/);
+    // 294 sat of change is kept at 2 sat/vB; at 3 sat/vB the 153 sat left is folded
+    expect((await replace(294n))?.fee).toEqual({ feeRate: '3' });
+  });
+
   it('B7 attachSignatures rejects a signature from another key', async () => {
     const from = await wallet();
     const other = await wallet();
@@ -204,6 +308,48 @@ describe('Bitcoin adapter against regtest', () => {
     expect(() => adapter.attachSignatures(unsigned, [good!, good!])).toThrow(
       /2 signatures for 1 inputs/,
     );
+  });
+
+  it('B8 a replacement pays at least 1 sat/vB more and the original is no longer known after it is accepted', async () => {
+    // two coins, so that the order of the inputs matters
+    const from = await walletWith(60_000n, 50_000n);
+    const to = (await wallet()).address;
+    const a = await prepare(from, to, 100_000n);
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
+    let previous = { unsigned: a.unsigned, fee: a.fee, signed: a.signed };
+    let paid = await pooledFee(a.signed.txid);
+    // a replacement of the replacement too: 2 sat/vB, then 3, then 4
+    for (const feeRate of ['3', '4']) {
+      const rep = await adapter.buildReplacement(a.intent, a.reservation, previous);
+      if (!rep) throw new Error('a Bitcoin replacement is never null');
+      expect(rep.fee).toEqual({ feeRate });
+      const signed = adapter.attachSignatures(rep.unsigned, await sign(from.keyId, rep.unsigned));
+      expect(await adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+
+      // the same coins in the same order, the same payment, less change
+      const [before, after] = await Promise.all([decode(previous.signed.raw), decode(signed.raw)]);
+      const coins = (tx: Decoded) => tx.vin.map((i) => `${i.txid}:${i.vout}:${i.sequence}`);
+      expect(coins(after)).toEqual(coins(before));
+      expect(after.vout[0]).toEqual(before.vout[0]);
+      expect(after.vout[1]!.value).toBeLessThan(before.vout[1]!.value);
+      // at least 1 sat more per vbyte of the replacement, more than BIP-125's 0.1
+      const now = await pooledFee(signed.txid);
+      expect(now.fee - paid.fee).toBeGreaterThanOrEqual(now.vsize);
+
+      expect(await adapter.getTxStatus(previous.signed.txid)).toEqual({ state: 'unknown' });
+      expect(await adapter.getTxStatus(signed.txid)).toEqual({ state: 'pending' });
+      previous = { ...rep, signed };
+      paid = now;
+    }
+    // the node keeps the replacement and refuses the original, which pays less
+    expect(await adapter.broadcast(a.signed)).toEqual({
+      outcome: 'rejected',
+      reason: expect.stringMatching(/insufficient fee/) as string,
+    });
+    await devnet.mine(1);
+    expect(await adapter.getTxStatus(previous.signed.txid)).toMatchObject({ state: 'confirmed' });
+    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'unknown' });
+    expect(await adapter.getBalance(to, 'native')).toBe(100_000n);
   });
 
   it('B9 a transfer from two coins signs each input with its own amount; change and fee are exact', async () => {
@@ -272,5 +418,38 @@ describe('Bitcoin adapter against regtest', () => {
       coins: [{ id: expect.stringMatching(/:\d+$/) as string, amount: '60000' }],
     });
     expect(await store.freeCoins(from.address)).toHaveLength(1);
+  });
+
+  it('B12 scanBlock lists every output that pays an address: payment, change, coinbase', async () => {
+    const from = await walletWith(100_000n);
+    const to = (await wallet()).address;
+    const a = await prepare(from, to, 50_000n);
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+    const tip = await adapter.getTip();
+    const { transfers } = await adapter.scanBlock(tip.height);
+
+    const { txid } = a.signed;
+    expect(transfers.filter((t) => t.txid === txid)).toEqual([
+      { txid, index: 0, to, asset: 'native', amount: 50_000n },
+      { txid, index: 1, to: from.address, asset: 'native', amount: 100_000n - 50_000n - 282n },
+    ]);
+    // the coinbase pays the miner in output 0; output 1, the witness commitment, pays no address
+    const block = await devnet.rpc.call<{ tx: ({ txid: string } & Decoded)[] }>('getblock', [
+      tip.hash,
+      2,
+    ]);
+    const coinbase = block.tx[0]!;
+    expect(coinbase.vout[1]?.scriptPubKey.address).toBeUndefined();
+    expect(transfers.filter((t) => t.txid === coinbase.txid)).toEqual([
+      {
+        txid: coinbase.txid,
+        index: 0,
+        to: coinbase.vout[0]!.scriptPubKey.address,
+        asset: 'native',
+        amount: btcToSats(coinbase.vout[0]!.value),
+      },
+    ]);
+    await expect(adapter.scanBlock(tip.height + 1)).rejects.toThrow(/Block height out of range/);
   });
 });

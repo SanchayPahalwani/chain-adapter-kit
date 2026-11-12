@@ -1,8 +1,12 @@
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { p2wpkh } from '@scure/btc-signer';
 import type { AssetId } from '../../core/adapter.js';
 import type { Devnet } from '../../conformance/harness.js';
+import { REGTEST } from './adapter.js';
 import { RpcError, bitcoinRpc, type BitcoinRpc } from './rpc.js';
 
 const FUNDER = 'funder';
+const ENOUGH = 100; // BTC; while the funder holds less, the blocks pay it
 const FEE_RATE = 2; // sat/vB for the funder's own payments
 const EXPIRY_HOURS = 336; // bitcoind's default -mempoolexpiry
 
@@ -76,8 +80,16 @@ export async function createBitcoinDevnet(
         throw error;
       });
 
+  // Every coin in the funder wallet makes each sendtoaddress slower, so once it holds enough, blocks
+  // pay a key that is thrown away. A new address every time either way: after invalidateblock, a
+  // block with the same template as an invalidated one is rejected as a duplicate.
+  const minerAddress = async () =>
+    (await funder<number>('getbalance')) < ENOUGH
+      ? freshAddress()
+      : p2wpkh(secp256k1.keygen().publicKey, REGTEST).address;
+
   const mine = async (blocks: number) => {
-    await rpc.call('generatetoaddress', [blocks, await freshAddress()]);
+    await rpc.call('generatetoaddress', [blocks, await minerAddress()]);
   };
 
   return {
@@ -90,8 +102,6 @@ export async function createBitcoinDevnet(
       await mine(1);
     },
 
-    // A fresh address each time: after invalidateblock, a block with the same template as an
-    // invalidated one is rejected as a duplicate.
     mine,
 
     // Replaces the last `depth` blocks with empty ones at the same heights. Their
@@ -103,7 +113,7 @@ export async function createBitcoinDevnet(
       await rpc.call('invalidateblock', [
         await rpc.call<string>('getblockhash', [height - depth + 1]),
       ]);
-      for (let i = 0; i < depth; i++) await rpc.call('generateblock', [await freshAddress(), []]);
+      for (let i = 0; i < depth; i++) await rpc.call('generateblock', [await minerAddress(), []]);
     },
 
     // No RPC removes a transaction, so this uses the mempool's 336 h expiry: move the node's

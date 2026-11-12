@@ -1,7 +1,6 @@
 // Needs `docker compose up -d --wait bitcoind`.
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { NETWORK, TEST_NETWORK, p2pkh, p2sh, p2tr, p2wpkh } from '@scure/btc-signer';
-import { beforeEach } from 'vitest';
 import { createBitcoinAdapter } from '../src/adapters/bitcoin/adapter.js';
 import { createBitcoinDevnet } from '../src/adapters/bitcoin/devnet.js';
 import { config } from '../src/config.js';
@@ -10,12 +9,6 @@ import { LocalSigner } from '../src/core/local-signer.js';
 
 // regtest addresses: testnet's base58 prefixes, and bech32 prefix bcrt
 const REGTEST = { ...TEST_NETWORK, bech32: 'bcrt' };
-
-// Not implemented until the next task (buildReplacement, scanBlock). Delete this list then.
-const notYet = ['C14', 'C15'];
-beforeEach(({ task, skip }) => {
-  if (notYet.some((check) => task.name.startsWith(`${check} `))) skip('not implemented yet');
-});
 
 runConformanceSuite('bitcoin-regtest', async () => {
   const devnet = await createBitcoinDevnet(config.bitcoinRpcUrl, config.bitcoinRpcAuth);

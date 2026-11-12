@@ -81,7 +81,9 @@ export interface Checkout {
 }
 
 export function checkoutOf(root: string): Checkout {
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+  // a large uncommitted diff passes the 1 MiB default output limit
+  const git = (...args: string[]) =>
+    execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   const head = git('rev-parse', '--short', 'HEAD').trim();
   const changed = git('status', '--porcelain')
     .split('\n')
@@ -108,7 +110,8 @@ const columns = [
   [
     'Worker kills',
     'worker processes that died by SIGKILL. A `kill at` worker kills itself once per withdrawal at ' +
-      'its crash point; in random kills the supervisor sends them, only to workers past start-up.',
+      'its crash point; in random kills the supervisor sends them, only to workers that have run ' +
+      'for a while past start-up.',
   ],
   ['Settled', 'withdrawals that ended `SETTLED`.'],
   ['Rejected', 'requests the policy refused (`REJECTED`); nothing may reach their destinations.'],

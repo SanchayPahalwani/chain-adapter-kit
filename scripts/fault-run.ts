@@ -86,7 +86,8 @@ process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
 const started = Date.now();
-const checkout = checkoutOf(root);
+// only a run that can write docs/results.md needs to know which code it ran
+const checkout = args['no-write'] || partial ? undefined : checkoutOf(root);
 const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const env = await makeEvmEnv();
 
@@ -190,7 +191,7 @@ async function report() {
     return;
   }
   if (args['no-write'] || !totals) return;
-  if (partial) {
+  if (partial || !checkout) {
     console.error(`${RESULTS_PATH} not written: only the full matrix at default counts writes it`);
     return;
   }

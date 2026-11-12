@@ -89,6 +89,14 @@ export interface SuperviseOptions {
   // SIGKILL a random worker this often, between min and max ms, and start another. Only workers
   // past start-up (worker-main.ts says so): a kill while one still loads would test nothing.
   killEveryMs?: [min: number, max: number];
+  // ...and only those that said so at least this long ago (default 0). However slow start-up is,
+  // each worker then has this long to work, so kills cannot keep the work from finishing. A kill
+  // attempt that finds no such worker kills nothing.
+  killAfterMs?: number;
+  // The work, started once every first worker has run killAfterMs; there are no kills before
+  // that, and `until` counts only once the work has finished. Work there from the start would be
+  // partly done (on a fast machine, all of it) before any worker could be killed.
+  submit?: () => Promise<void>;
   until?: () => Promise<boolean>; // when to stop (default: every withdrawal is terminal)
 }
 
@@ -96,23 +104,33 @@ export interface SuperviseOptions {
  * Runs `workers` worker processes until `until` holds, `timeoutMs` has passed or `signal` aborts,
  * starting a new worker each time one dies; then stops the live ones. A SIGKILL counts as a kill
  * only if this function sent it or the workers have a crash point; any other exit of a worker
- * throws, and so does an abort, once the live workers have stopped.
+ * throws, and so do an abort and a failed `submit`, once the live workers have stopped.
  */
 export async function supervise(
   run: Run,
   opts: WorkerOptions,
   timeoutMs: number,
-  { workers = 1, killEveryMs, until }: SuperviseOptions = {},
+  { workers = 1, killEveryMs, killAfterMs = 0, submit, until }: SuperviseOptions = {},
   signal?: AbortSignal,
 ): Promise<Supervised> {
   const deadline = Date.now() + timeoutMs;
-  const done = until ?? (async () => (await unfinished(run.box.db)) === 0);
   const live = new Map<ChildProcess, Promise<Exit>>();
   const killedHere = new WeakSet<ChildProcess>();
-  const ready = new WeakSet<ChildProcess>();
+  const startedAt = new WeakMap<ChildProcess, number>(); // when each said it was past start-up
+  const killable = (c: ChildProcess) =>
+    running(c) && (startedAt.get(c) ?? Infinity) <= Date.now() - killAfterMs;
   const killGap = () =>
     killEveryMs ? killEveryMs[0] + Math.random() * (killEveryMs[1] - killEveryMs[0]) : Infinity;
-  let nextKill = Date.now() + killGap();
+  // submit(), once started: it settles without rejecting, and rethrow() throws what it threw
+  const work: { started?: Promise<void>; finished: boolean; error?: { thrown: unknown } } = {
+    finished: !submit,
+  };
+  const rethrow = () => {
+    if (work.error) throw work.error.thrown;
+  };
+  const condition = until ?? (async () => (await unfinished(run.box.db)) === 0);
+  const done = async () => work.finished && (await condition());
+  let nextKill = submit ? Infinity : Date.now() + killGap();
   let kills = 0;
   let killsMidHandler = 0;
 
@@ -134,6 +152,7 @@ export async function supervise(
         live.delete(child);
         account(child, await exit, false);
       }
+      rethrow();
       // whether `until` held when stopping was decided: a condition such as "every withdrawal
       // is BROADCAST" need not hold any more once the workers have stopped
       const held = !signal?.aborted && (await done());
@@ -146,16 +165,25 @@ export async function supervise(
           const child = stopping[i]?.[0];
           if (child) account(child, e.value, true);
         });
+        await work.started;
         if (signal?.aborted) throw new Error('interrupted');
+        rethrow();
         return { kills, killsMidHandler, timedOut: !held && !(await done()) };
       }
       while (live.size < workers) {
         const child = spawnWorker(run, opts);
-        child.once('message', () => ready.add(child));
+        child.once('message', () => startedAt.set(child, Date.now()));
         live.set(child, once(child, 'exit') as Promise<Exit>);
       }
+      if (submit && !work.started && [...live.keys()].every(killable)) {
+        work.started = submit().then(
+          () => void (work.finished = true),
+          (thrown: unknown) => void (work.error = { thrown }),
+        );
+        nextKill = Date.now() + killGap();
+      }
       if (Date.now() >= nextKill) {
-        const targets = [...live.keys()].filter((c) => running(c) && ready.has(c));
+        const targets = [...live.keys()].filter(killable);
         const victim = targets[Math.floor(Math.random() * targets.length)];
         if (victim) {
           killedHere.add(victim);

@@ -15,6 +15,7 @@ import { makeEvmEnv } from '../scripts/lib/evm-env.js';
 import { openSandbox, type Sandbox } from '../scripts/lib/sandbox.js';
 import {
   spawnWorker,
+  supervise,
   superviseUntilDone,
   type Run,
   type Supervised,
@@ -225,6 +226,28 @@ describe('fault run', () => {
       expect(await eventsOf(box.db, w.id)).toEqual(['APPROVED>RESERVED']);
     },
   );
+
+  it('X5 random kills spare a worker for killAfterMs once it started', PROCESS_TEST, async () => {
+    const killAfterMs = 2000;
+    // When the supervisor's loop first saw each worker's start: a worker logs it just before it
+    // tells the supervisor, and the loop checks `until` at least every 100 ms.
+    const seen: number[] = [];
+    const until = () => {
+      const started = (readFileSync(logPath, 'utf8').match(/: started/g) ?? []).length;
+      while (seen.length < started) seen.push(Date.now());
+      return Promise.resolve(started >= 3); // two workers killed, a third started
+    };
+    const supervised = await supervise(run, { timings }, 40_000, {
+      killEveryMs: [50, 50],
+      killAfterMs,
+      until,
+    });
+    expect(supervised).toEqual({ kills: 2, killsMidHandler: 0, timedOut: false });
+    // A kill attempt every 50 ms, yet the two killed workers each lived killAfterMs once started.
+    // The second and third start-ups (each 300 ms or more) cover the 100 ms the loop can lag.
+    const [first = 0, , third = 0] = seen;
+    expect(third - first).toBeGreaterThanOrEqual(2 * killAfterMs);
+  });
 });
 
 // The script end to end, on two scenarios: the whole quick matrix is a separate CI step.
@@ -233,7 +256,9 @@ describe('fault-run script', () => {
 
   it(
     'X4 the quick fault run exits 0 and reports zero sent twice, lost, unfinished and drift',
-    { timeout: 180_000 },
+    // more than the two scenarios' own time limits together (140 s and 50 s), so a slow run
+    // fails with the script's reason
+    { timeout: 240_000 },
     async () => {
       const args = ['--quick', '--no-write', '--json', '--only', 'random_kills,duplicate_requests'];
       const child = spawn('npx', ['tsx', 'scripts/fault-run.ts', ...args], {

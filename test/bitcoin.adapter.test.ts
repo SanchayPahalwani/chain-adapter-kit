@@ -1,5 +1,5 @@
-// Bitcoin adapter paths the conformance suite does not reach. B1 runs against a stub node; the
-// rest need `docker compose up -d --wait bitcoind`.
+// Bitcoin adapter paths the conformance suite does not reach. B1 and B11 run against a stub node;
+// the rest need `docker compose up -d --wait bitcoind`.
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -45,6 +45,26 @@ describe('createBitcoinAdapter', () => {
       mainnet.close();
     }
   });
+
+  it('B11 refuses a node without a synced transaction index, and a fee rate that is not positive', async () => {
+    const regtest = { chain: 'regtest', blocks: 1 };
+    const start = async (index: unknown, feeRate?: bigint) => {
+      const node = await stubNode({ getblockchaininfo: regtest, getindexinfo: index });
+      try {
+        await createBitcoinAdapter({ rpcUrl: node.url, auth: config.bitcoinRpcAuth, feeRate });
+      } finally {
+        node.close();
+      }
+    };
+    const synced = { txindex: { synced: true, best_block_height: 1 } };
+    await expect(start({})).rejects.toThrow(/-txindex=1/); // started without -txindex
+    await expect(start({ txindex: { synced: false, best_block_height: 0 } })).rejects.toThrow(
+      /synced transaction index/,
+    );
+    await expect(start(synced, 0n)).rejects.toThrow(/fee rate must be above 0/);
+    await expect(start(synced, -2n)).rejects.toThrow(/fee rate must be above 0/);
+    await expect(start(synced)).resolves.toBeUndefined();
+  });
 });
 
 describe('Bitcoin adapter against regtest', () => {
@@ -79,6 +99,13 @@ describe('Bitcoin adapter against regtest', () => {
       [raw],
     );
     return tx.vout.map((o) => o.scriptPubKey.address);
+  }
+
+  // a wallet holding one confirmed coin per amount
+  async function walletWith(...coins: bigint[]) {
+    const w = await wallet();
+    for (const amount of coins) await devnet.fund(w.address, 'native', amount);
+    return w;
   }
 
   it('B2 syncInputs and getBalance survive a parallel scan', async () => {
@@ -166,5 +193,84 @@ describe('Bitcoin adapter against regtest', () => {
       good![64]! ^ 1,
     );
     expect(adapter.attachSignatures(unsigned, [highS])).toEqual(signed);
+
+    // malformed: a signature without its recovery id, a recovery id of 2, one signature too many
+    expect(() => adapter.attachSignatures(unsigned, [good!.subarray(0, 64)])).toThrow(
+      /64 bytes, not 65/,
+    );
+    const two = Uint8Array.from(good!);
+    two[64] = 2;
+    expect(() => adapter.attachSignatures(unsigned, [two])).toThrow(/recovery id must be 0 or 1/);
+    expect(() => adapter.attachSignatures(unsigned, [good!, good!])).toThrow(
+      /2 signatures for 1 inputs/,
+    );
+  });
+
+  it('B9 a transfer from two coins signs each input with its own amount; change and fee are exact', async () => {
+    // 2 inputs, 2 outputs: 209 vB at 2 sat/vB = 418 sat; change 60,000 + 50,000 - 100,000 - 418
+    const from = await walletWith(60_000n, 50_000n);
+    const to = (await wallet()).address;
+    const intent = { from: from.address, to, asset: 'native', amount: 100_000n };
+    const fee = await adapter.quoteFee(intent);
+    const store = new MemoryInputStore();
+    await adapter.syncInputs(store, from.address);
+    const reservation = await adapter.reserveInputs(store, intent, fee);
+    // largest first: the 60,000 coin alone does not pay 100,000 plus the fee
+    expect((reservation as { coins: { amount: string }[] }).coins.map((c) => c.amount)).toEqual([
+      '60000',
+      '50000',
+    ]);
+    const unsigned = await adapter.buildTransfer(intent, reservation, fee);
+    expect(unsigned.signingPayloads).toHaveLength(2);
+    expect(unsigned.signingPayloads[0]).not.toBe(unsigned.signingPayloads[1]);
+    const signed = adapter.attachSignatures(unsigned, await sign(from.keyId, unsigned));
+    expect(await outputs(signed.raw)).toEqual([to, from.address]);
+    expect(await adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+    await devnet.mine(1);
+
+    const node = await devnet.rpc.call<{ vin: unknown[]; vout: { value: number }[]; fee: number }>(
+      'getrawtransaction',
+      [signed.txid, 2],
+    );
+    expect(node.vin).toHaveLength(2);
+    expect(node.vout.map((o) => o.value)).toEqual([0.001, 0.00009582]);
+    expect(node.fee).toBe(0.00000418);
+    expect(await adapter.getTxStatus(signed.txid)).toMatchObject({
+      state: 'confirmed',
+      feePaid: 418n,
+    });
+    expect(await adapter.getBalance(to, 'native')).toBe(100_000n);
+    expect(await adapter.getBalance(from.address, 'native')).toBe(9_582n);
+  });
+
+  it('B10 quoteFee refuses dust; reserveInputs refuses what the free coins cannot pay and reserves nothing', async () => {
+    const from = await walletWith(60_000n, 50_000n);
+    const to = (await wallet()).address;
+    const intent = (amount: bigint, asset = 'native') => ({
+      from: from.address,
+      to,
+      asset,
+      amount,
+    });
+    await expect(adapter.quoteFee(intent(293n))).rejects.toThrow(/below the 294 sat dust limit/);
+    await expect(adapter.quoteFee(intent(294n))).resolves.toEqual({ feeRate: '2' });
+
+    const fee: Json = { feeRate: '2' };
+    const store = new MemoryInputStore();
+    await adapter.syncInputs(store, from.address);
+    // both coins together hold 110,000, short of 110,000 plus the fee
+    await expect(adapter.reserveInputs(store, intent(110_000n), fee)).rejects.toThrow(
+      /not enough free coins/,
+    );
+    await expect(adapter.reserveInputs(store, intent(1_000n, 'token'), fee)).rejects.toThrow(
+      /unknown asset token/,
+    );
+    expect(await store.freeCoins(from.address)).toHaveLength(2);
+    // the largest coin is still free: it pays a smaller transfer on its own
+    const reservation = await adapter.reserveInputs(store, intent(50_000n), fee);
+    expect(reservation).toEqual({
+      coins: [{ id: expect.stringMatching(/:\d+$/) as string, amount: '60000' }],
+    });
+    expect(await store.freeCoins(from.address)).toHaveLength(1);
   });
 });

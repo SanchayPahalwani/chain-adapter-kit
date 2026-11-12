@@ -212,6 +212,8 @@ export function runConformanceSuite(
 
     it('C13 two reservations from one store do not conflict', async () => {
       const from = await fundedWallet(native());
+      // a UTXO chain needs two coins for two concurrent reservations
+      await h.devnet.fund(from.address, native(), 100n * h.unit(native()));
       const store = new MemoryInputStore();
       const a = await prepare(from, (await newWallet()).address, native(), h.unit(native()), store);
       const b = await prepare(from, (await newWallet()).address, native(), h.unit(native()), store);

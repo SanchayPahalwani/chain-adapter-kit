@@ -2,7 +2,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { Address, OutScript, SigHash, Transaction, p2wpkh } from '@scure/btc-signer';
 import { hash160 } from '@scure/btc-signer/utils.js';
-import type { ChainAdapter, TxStatus, UnsignedTx } from '../../core/adapter.js';
+import type { ChainAdapter, TransferIntent, TxStatus, UnsignedTx } from '../../core/adapter.js';
 import { RpcError, bitcoinRpc, btcToSats } from './rpc.js';
 
 export interface BitcoinAdapterOptions {
@@ -49,11 +49,13 @@ function keyHash(address: string): Uint8Array {
   return decoded.hash;
 }
 
-// Size before signing, P2WPKH inputs and outputs (fewer than 253 of each): 41 bytes per input,
-// 31 per output, and a witness of at most 109 bytes per input (a DER signature of up to 72 bytes
-// with its sighash byte, the 33-byte key, three length bytes) that counts a quarter.
-function vsize(inputs: number, outputs: number): bigint {
-  return BigInt(Math.ceil((4 * (10 + 41 * inputs + 31 * outputs) + 2 + 109 * inputs) / 4));
+// The fee in sat at `feeRate` sat/vB, for a size estimated before signing. P2WPKH inputs and
+// outputs (fewer than 253 of each): 41 bytes per input, 31 per output, and a witness of at most
+// 109 bytes per input (a DER signature of up to 72 bytes with its sighash byte, the 33-byte key,
+// three length bytes) that counts a quarter. Reservation and build both use this.
+function feeFor(inputs: number, outputs: number, feeRate: bigint): bigint {
+  const vsize = Math.ceil((4 * (10 + 41 * inputs + 31 * outputs) + 2 + 109 * inputs) / 4);
+  return BigInt(vsize) * feeRate;
 }
 
 // One BIP-143 digest per input, unlike EVM's one per transaction; each commits to its input's
@@ -64,7 +66,21 @@ function digests(tx: Transaction, from: string, amounts: bigint[]): Uint8Array[]
   return amounts.map((amount, i) => tx.preimageWitnessV0(i, code, SigHash.ALL, amount));
 }
 
-function unsignedTx(tx: Transaction, from: string, amounts: bigint[]): UnsignedTx {
+// Spends every coin: `amount` to `intent.to`, `fee` to the miner, and the rest back to the sender,
+// unless it is below dust, when it goes to the fee too.
+function assemble(intent: TransferIntent, coins: Reservation['coins'], fee: bigint): UnsignedTx {
+  const tx = new Transaction({ version: 2, lockTime: 0 });
+  for (const { id } of coins) {
+    const [txid, vout] = id.split(':');
+    tx.addInput({ txid: hexToBytes(txid!), index: Number(vout), sequence: SEQUENCE });
+  }
+  tx.addOutputAddress(intent.to, intent.amount, REGTEST);
+  const amounts = coins.map((c) => BigInt(c.amount));
+  const total = amounts.reduce((sum, a) => sum + a, 0n);
+  const change = total - intent.amount - fee;
+  if (change < 0n) throw new Error(`the coins hold ${total} sat, short of amount and fee`);
+  if (change >= DUST) tx.addOutputAddress(intent.from, change, REGTEST);
+  const { from } = intent;
   const body: Body = { tx: bytesToHex(tx.unsignedTx), from, amounts: amounts.map(String) };
   return { body, signingPayloads: digests(tx, from, amounts).map((d) => bytesToHex(d)) };
 }
@@ -81,23 +97,31 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   if (info.chain !== 'regtest') {
     throw new Error(`refusing chain "${info.chain}": only regtest is allowed`);
   }
+  // getTxStatus finds a confirmed transaction by its id alone, which needs the transaction index
+  const index = await rpc.call<{ txindex?: { synced: boolean } }>('getindexinfo', ['txindex']);
+  if (index.txindex?.synced !== true) {
+    throw new Error('the node needs a synced transaction index: start bitcoind with -txindex=1');
+  }
   const feeRate = opts.feeRate ?? 2n;
+  if (feeRate <= 0n) throw new Error(`fee rate must be above 0 sat/vB, got ${feeRate}`);
 
   function native(asset: string): void {
     if (asset !== 'native') throw new Error(`unknown asset ${asset}`);
   }
 
   // The node scans the UTXO set for one caller at a time and answers -8 to any other (this
-  // adapter or another client), so wait for that scan to finish.
+  // adapter or another client), so wait up to 5 s for that scan to finish.
   async function scan(address: string): Promise<Scan> {
-    for (let attempt = 1; ; attempt++) {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
       try {
         const result = await rpc.call<Scan>('scantxoutset', ['start', [`addr(${address})`]]);
         if (!result.success) throw new Error(`the scan for ${address} was aborted`);
         return result;
       } catch (error) {
-        const busy = error instanceof RpcError && /already in progress/.test(error.message);
-        if (!busy || attempt === 100) throw error;
+        const busy =
+          error instanceof RpcError && error.code === -8 && /in progress/.test(error.message);
+        if (!busy || Date.now() > deadline) throw error;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
@@ -109,9 +133,9 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   }
 
   async function getTxStatus(txid: string): Promise<TxStatus> {
-    // txindex is on, so this finds any transaction in a block, not only the node wallet's
+    // the txindex (checked at startup) finds any transaction in a block, not only the wallet's
     const tx = await rpc
-      .call<{ blockhash?: string; fee: number }>('getrawtransaction', [txid, 2])
+      .call<{ blockhash?: string; fee?: number }>('getrawtransaction', [txid, 2])
       .catch(notFound);
     if (!tx) return { state: 'unknown' };
     if (!tx.blockhash) return { state: 'pending' }; // answered from the mempool
@@ -124,12 +148,14 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
       const pooled = await rpc.call('getmempoolentry', [txid]).catch(notFound);
       return pooled ? { state: 'pending' } : { state: 'unknown' };
     }
+    // with txindex the node reports the fee of every transaction in a block but a coinbase
+    if (tx.fee === undefined) throw new Error(`the node reports no fee for ${txid}`);
     return {
       state: 'confirmed',
       block: { height: block.height, hash: tx.blockhash },
       confirmations: block.confirmations,
       succeeded: true, // a Bitcoin transaction in a block cannot fail
-      feePaid: btcToSats(tx.fee), // reported for a transaction in a block
+      feePaid: btcToSats(tx.fee),
     };
   }
 
@@ -162,11 +188,16 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
     // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
     async quoteFee(intent): Promise<Fee> {
       native(intent.asset);
+      // checked here, before any coin is reserved: the node relays no output this small
+      if (intent.amount < DUST)
+        throw new Error(`${intent.amount} sat is below the ${DUST} sat dust limit`);
       return { feeRate: feeRate.toString() };
     },
 
-    // Coins instead of a nonce. Confirmed coins only, so a transfer never spends an output that
-    // could vanish with the transaction that created it.
+    // Coins instead of a nonce. Only confirmed coins (the UTXO set holds no mempool outputs), so
+    // the adapter never spends an unconfirmed output. A confirmed coin can still be reorganised
+    // away: it stays in the store, and the transfer that spends it is rejected by the node, which
+    // loses no money.
     async syncInputs(store, address) {
       const { unspents } = await scan(address);
       await store.putCoins(
@@ -181,8 +212,9 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
 
     // Largest coins first, until they pay the amount and the fee of a transaction with change.
     async reserveInputs(store, intent, fee): Promise<Reservation> {
+      native(intent.asset);
       const rate = BigInt((fee as Fee).feeRate);
-      const need = (inputs: number) => intent.amount + vsize(inputs, 2) * rate;
+      const need = (inputs: number) => intent.amount + feeFor(inputs, 2, rate);
       const free = await store.freeCoins(intent.from);
       free.sort((a, b) => (a.amount === b.amount ? 0 : a.amount < b.amount ? 1 : -1));
       const coins = [];
@@ -202,18 +234,7 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
       native(intent.asset);
       if (!isP2wpkh(intent.to)) throw new Error(`not a regtest P2WPKH address: ${intent.to}`);
       const { coins } = reservation as Reservation;
-      const tx = new Transaction({ version: 2, lockTime: 0 });
-      for (const { id } of coins) {
-        const [txid, vout] = id.split(':');
-        tx.addInput({ txid: hexToBytes(txid!), index: Number(vout), sequence: SEQUENCE });
-      }
-      tx.addOutputAddress(intent.to, intent.amount, REGTEST);
-      const amounts = coins.map((c) => BigInt(c.amount));
-      const total = amounts.reduce((sum, a) => sum + a, 0n);
-      const change = total - intent.amount - vsize(coins.length, 2) * BigInt((fee as Fee).feeRate);
-      if (change < 0n) throw new Error(`the reserved ${total} sat do not pay amount and fee`);
-      if (change >= DUST) tx.addOutputAddress(intent.from, change, REGTEST);
-      return unsignedTx(tx, intent.from, amounts);
+      return assemble(intent, coins, feeFor(coins.length, 2, BigInt((fee as Fee).feeRate)));
     },
 
     attachSignatures(unsigned, signatures) {

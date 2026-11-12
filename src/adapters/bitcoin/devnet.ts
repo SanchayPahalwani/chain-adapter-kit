@@ -33,6 +33,10 @@ export async function createBitcoinDevnet(
 
   const funder = <T>(method: string, params: unknown[] = []) => rpc.call<T>(method, params, FUNDER);
   const freshAddress = () => funder<string>('getnewaddress');
+  // positional: address, amount, comment, comment_to, subtract_fee, replaceable, conf_target, mode, avoid_reuse, fee_rate
+  const pay = (address: string, btc: string) =>
+    funder('sendtoaddress', [address, btc, '', '', false, true, null, 'unset', null, FEE_RATE]);
+  await rpc.call('setmocktime', [0]); // a killed run may have left the clock moved
 
   const loaded = await rpc.call<string[]>('listwallets');
   if (!loaded.includes(FUNDER)) {
@@ -82,19 +86,7 @@ export async function createBitcoinDevnet(
     // Not safe to call concurrently with itself: the funder picks its coins when it sends.
     async fund(address: string, asset: AssetId, amount: bigint) {
       if (asset !== 'native') throw new Error(`bitcoin has no asset "${asset}"`);
-      // positional: address, amount, comment, comment_to, subtract_fee, replaceable, conf_target, mode, avoid_reuse, fee_rate
-      await funder('sendtoaddress', [
-        address,
-        satsToBtc(amount),
-        '',
-        '',
-        false,
-        true,
-        null,
-        'unset',
-        null,
-        FEE_RATE,
-      ]);
+      await pay(address, satsToBtc(amount));
       await mine(1);
     },
 
@@ -117,48 +109,64 @@ export async function createBitcoinDevnet(
     // No RPC removes a transaction, so this uses the mempool's 336 h expiry: move the node's
     // clock past it, submit one payment (expiry runs when a transaction is accepted), put the
     // clock back. That expires every transaction in the pool, so the others are put back
-    // afterwards (a child of the dropped one cannot return, as on a real eviction). A transaction
-    // paying a funder address would be resubmitted by the wallet, so tests send elsewhere.
-    // Nothing is mined while the clock is moved: block times would be 337 h ahead.
-    // A txid the node does not hold passes silently; a caller dropping "every attempt" includes
-    // ones already replaced.
+    // afterwards (a child of the dropped one cannot return, as on a real eviction).
+    // Caller rule: while this runs no other process may submit transactions and nothing may
+    // mine (block times would be 337 h ahead); the fault run and the tests comply.
+    // A transaction paying a funder address would be resubmitted by the wallet, so tests send
+    // elsewhere. A txid the node does not hold passes silently (a caller dropping "every
+    // attempt" includes ones already replaced); a mined one throws, as mined is not dropped.
     async dropFromMempool(txid: string) {
       const pool = await mempool();
-      if (!pool[txid]) return;
-      const others = await Promise.all(
-        Object.entries(pool)
-          .filter(([id]) => id !== txid)
-          .sort(([, a], [, b]) => a.ancestorcount - b.ancestorcount)
-          .map(async ([id, entry]) => ({
-            id,
-            entry,
-            raw: await rpc.call<string>('getrawtransaction', [id]),
-          })),
-      );
+      if (!pool[txid]) {
+        const tx = await rpc
+          .call<{ confirmations?: number }>('getrawtransaction', [txid, true])
+          .catch((error: unknown) => {
+            if (error instanceof RpcError && error.code === -5) return null;
+            throw error;
+          });
+        if ((tx?.confirmations ?? 0) >= 1) throw new Error(`${txid} is mined, not pending`);
+        return;
+      }
+      // Parents before children (fewer ancestors first), so they can be resubmitted in this order.
+      const order = Object.entries(pool)
+        .filter(([id]) => id !== txid)
+        .sort(([, a], [, b]) => a.ancestorcount - b.ancestorcount);
+      const others: { id: string; depends: string[]; raw: string }[] = [];
+      for (const [id, entry] of order) {
+        others.push({
+          id,
+          depends: entry.depends,
+          raw: await rpc.call<string>('getrawtransaction', [id]),
+        });
+      }
+      // Based on the newest entry, not on the host clock: the node's clock may differ from this
+      // machine's, and every entry must be more than 336 h old at the mocked time.
       const newest = Math.max(...Object.values(pool).map((e) => e.time));
       await rpc.call('setmocktime', [newest + (EXPIRY_HOURS + 1) * 3600]);
       try {
-        await funder('sendtoaddress', [
-          await freshAddress(),
-          '0.0001',
-          '',
-          '',
-          false,
-          true,
-          null,
-          'unset',
-          null,
-          FEE_RATE,
-        ]);
+        await pay(await freshAddress(), '0.0001');
       } finally {
         await rpc.call('setmocktime', [0]);
       }
       const gone = new Set([txid]);
-      for (const { id, entry, raw } of others) {
-        if (entry.depends.some((parent) => gone.has(parent))) gone.add(id);
-        else await rpc.call('sendrawtransaction', [raw]);
+      const failures: string[] = [];
+      for (const { id, depends, raw } of others) {
+        if (depends.some((parent) => gone.has(parent))) {
+          gone.add(id);
+          continue;
+        }
+        try {
+          await rpc.call('sendrawtransaction', [raw]);
+        } catch (error) {
+          failures.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       if (await inMempool(txid)) throw new Error(`${txid} is still in the mempool after the drop`);
+      if (failures.length > 0) {
+        throw new Error(
+          `could not put back ${failures.length} transaction(s): ${failures.join('; ')}`,
+        );
+      }
     },
 
     // Confirmed coins of the address (scantxoutset sees no mempool outputs), then who spends

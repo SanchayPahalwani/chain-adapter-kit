@@ -27,7 +27,12 @@ export function bitcoinRpc(url: string, auth: { user: string; password: string }
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(30_000),
       });
+      // a failed call has a JSON body; a 401, 403 or 503 from the HTTP layer may not
+      if (!res.ok && !res.headers.get('content-type')?.includes('json')) {
+        throw new Error(`bitcoind ${method}: HTTP ${res.status}`);
+      }
       const body = (await res.json()) as {
         result: T;
         error?: { code: number; message: string } | null;

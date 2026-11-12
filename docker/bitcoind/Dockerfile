@@ -31,7 +31,6 @@ COPY --from=fetch /usr/local/bin/bitcoind /usr/local/bin/bitcoin-cli /usr/local/
 RUN useradd --system --create-home --uid 1000 bitcoin \
  && mkdir -p /home/bitcoin/.bitcoin && chown bitcoin:bitcoin /home/bitcoin/.bitcoin
 USER bitcoin
-VOLUME ["/home/bitcoin/.bitcoin"]
 EXPOSE 18443
 ENTRYPOINT ["bitcoind"]
 CMD ["-regtest", "-printtoconsole"]

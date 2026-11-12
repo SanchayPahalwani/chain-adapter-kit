@@ -1,6 +1,6 @@
 // The Bitcoin regtest node and its devnet controls. Needs `docker compose up -d --wait bitcoind`.
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { hex } from '@scure/base';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { OutScript, SigHash, Transaction, p2wpkh } from '@scure/btc-signer';
 import { hash160 } from '@scure/btc-signer/utils.js';
 import { beforeAll, describe, expect, it } from 'vitest';
@@ -38,31 +38,51 @@ async function coins(address: string) {
   return scan.unspents;
 }
 
-// Spends the address's one coin to `to` (fee 400 sat), signed with the signer's key.
-async function spendFrom(key: Awaited<ReturnType<typeof newKey>>, to: string) {
-  const [coin] = await coins(key.address);
-  if (!coin) throw new Error(`no coin at ${key.address}`);
-  const amount = btcToSats(coin.amount);
-  const script = hex.decode(coin.scriptPubKey);
+interface Coin {
+  txid: string;
+  vout: number;
+  amount: bigint;
+  script: Uint8Array;
+}
+
+// Spends `coin` (owned by the key) to `to` for a fee of 400 sat, signed with the key.
+async function signSpend(key: Awaited<ReturnType<typeof newKey>>, coin: Coin, to: string) {
   const tx = new Transaction({ version: 2, lockTime: 0 });
   tx.addInput({
-    txid: hex.decode(coin.txid),
+    txid: hexToBytes(coin.txid),
     index: coin.vout,
     sequence: 0xfffffffd,
-    witnessUtxo: { script, amount },
+    witnessUtxo: { script: coin.script, amount: coin.amount },
   });
-  tx.addOutputAddress(to, amount - 400n, REGTEST);
-  const program = OutScript.decode(script);
+  const out = coin.amount - 400n;
+  tx.addOutputAddress(to, out, REGTEST);
+  const program = OutScript.decode(coin.script);
   if (program.type !== 'wpkh') throw new Error('expected a P2WPKH coin');
   const scriptCode = OutScript.encode({ type: 'pkh', hash: program.hash });
-  const digest = tx.preimageWitnessV0(0, scriptCode, SigHash.ALL, amount); // the 32-byte digest
+  const digest = tx.preimageWitnessV0(0, scriptCode, SigHash.ALL, coin.amount); // the 32-byte digest
   const sig65 = await key.signer.sign('k', 'secp256k1', digest); // r || s || recovery id
   const sig = secp256k1.Signature.fromBytes(sig65.subarray(0, 64), 'compact');
   const pub = await key.signer.publicKey('k', 'secp256k1');
-  if (hex.encode(hash160(pub)) !== hex.encode(program.hash)) throw new Error('wrong key');
+  if (bytesToHex(hash160(pub)) !== bytesToHex(program.hash)) throw new Error('wrong key');
   tx.updateInput(0, { partialSig: [[pub, Uint8Array.of(...sig.toBytes('der'), SigHash.ALL)]] });
   tx.finalize();
-  return { raw: hex.encode(tx.extract()), txid: tx.id };
+  return { raw: bytesToHex(tx.extract()), txid: tx.id, out };
+}
+
+// Spends the address's one confirmed coin.
+async function spendFrom(key: Awaited<ReturnType<typeof newKey>>, to: string) {
+  const [coin] = await coins(key.address);
+  if (!coin) throw new Error(`no coin at ${key.address}`);
+  return signSpend(
+    key,
+    {
+      txid: coin.txid,
+      vout: coin.vout,
+      amount: btcToSats(coin.amount),
+      script: hexToBytes(coin.scriptPubKey),
+    },
+    to,
+  );
 }
 
 const height = () => devnet.rpc.call<number>('getblockcount');
@@ -131,14 +151,43 @@ describe('bitcoin devnet', () => {
 
     expect(await inMempool(txid)).toBe(false);
     // the clock is back to normal: mining works and block times are sane
+    const prev = await devnet.rpc.call<{ time: number }>('getblockheader', [
+      await devnet.rpc.call<string>('getbestblockhash'),
+    ]);
     const [hash] = await devnet.rpc.call<string[]>('generatetoaddress', [
       1,
       await devnet.rpc.call<string>('getnewaddress', [], 'funder'),
     ]);
     const block = await devnet.rpc.call<{ time: number }>('getblockheader', [hash]);
-    expect(Math.abs(block.time - Date.now() / 1000)).toBeLessThan(600);
+    expect(block.time - prev.time).toBeLessThan(600); // not 337 h later
     expect(await devnet.rpc.call<string>('sendrawtransaction', [raw])).toBe(txid);
     expect(await inMempool(txid)).toBe(true);
+    await devnet.mine(1);
+  });
+
+  it('D5b dropping A also drops its child B, and leaves the unrelated C pending', async () => {
+    const [k1, k2, k3, k4] = await Promise.all([newKey(), newKey(), newKey(), newKey()]);
+    await devnet.fund(k1.address, 'native', 100_000n);
+    await devnet.fund(k4.address, 'native', 100_000n);
+    const a = await spendFrom(k1, k2.address);
+    const b = await signSpend(
+      k2,
+      {
+        txid: a.txid,
+        vout: 0,
+        amount: a.out,
+        script: p2wpkh(await k2.signer.publicKey('k', 'secp256k1'), REGTEST).script,
+      },
+      k3.address,
+    );
+    const c = await spendFrom(k4, k3.address);
+    for (const tx of [a, b, c]) await devnet.rpc.call('sendrawtransaction', [tx.raw]);
+
+    await devnet.dropFromMempool(a.txid);
+
+    expect(await inMempool(a.txid)).toBe(false);
+    expect(await inMempool(b.txid)).toBe(false);
+    expect(await inMempool(c.txid)).toBe(true);
     await devnet.mine(1);
   });
 

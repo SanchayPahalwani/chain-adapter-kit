@@ -91,20 +91,19 @@ export async function reconcile(
   assets: Record<string, AssetId[]>,
 ): Promise<ReconcileReport> {
   const runtimes = new Map<string, ChainRuntime>();
-  for (const chain of Object.keys(assets)) {
+  const wanted = Object.entries(assets).flatMap(([chain, list]) => {
     const rt = chains[chain];
     if (!rt) throw new Error(`no chain runtime for ${chain}`);
     runtimes.set(chain, rt);
-  }
-  const wanted = [...runtimes].flatMap(([chain, rt]) =>
-    (assets[chain] ?? []).map((asset) => ({ chain, asset, rt, la: ledgerAsset(chain, asset) })),
-  );
+    return list.map((asset) => ({ chain, asset, rt, la: ledgerAsset(chain, asset) }));
+  });
   if (wanted.length === 0) throw new Error('reconcile: no chain and asset to compare');
 
   // One snapshot, so the custody balances, withdrawals and checks describe one instant.
   const snap = await db.begin('isolation level repeatable read read only', async (tx) => {
-    const custody = await tx<{ asset: string; balance: bigint }[]>`
-      select asset, balance from ledger_accounts where name = 'custody:' || asset order by asset`;
+    // by name, which is what acct.custody makes and the ledger checks: custody:<chain>:<asset>
+    const custody = await tx<{ name: string; balance: bigint }[]>`
+      select name, balance from ledger_accounts where starts_with(name, 'custody:') order by name`;
     const attempts = await tx<AttemptRow[]>`
       select w.id, w.chain, w.asset, w.amount, t.txid
         from withdrawals w join tx_attempts t on t.withdrawal_id = w.id
@@ -112,11 +111,11 @@ export async function reconcile(
        order by w.id, t.attempt_no`;
     return { custody, attempts, checks: await ledgerChecks(tx) };
   });
-  const custody = new Map(snap.custody.map((c) => [c.asset, c.balance]));
-  const covered = new Set(wanted.map((w) => w.la));
+  const custody = new Map(snap.custody.map((c) => [c.name, c.balance]));
+  const covered = new Set(wanted.map((w) => acct.custody(w.la)));
   const uncovered = snap.custody
-    .filter((c) => c.balance !== 0n && !covered.has(c.asset))
-    .map((c) => `${acct.custody(c.asset)}: ${c.balance}`);
+    .filter((c) => c.balance !== 0n && !covered.has(c.name))
+    .map((c) => `${c.name}: ${c.balance}`);
 
   // The database is read once, but the chain reads cannot be pinned to that instant. A transfer
   // that confirms, or is reorganised out, between an attempt's status read and the balance read
@@ -144,7 +143,7 @@ export async function reconcile(
 
   const rows: ReconcileRow[] = [];
   for (const { chain, asset, rt, la } of wanted) {
-    const ledger = custody.get(la) ?? 0n;
+    const ledger = custody.get(acct.custody(la)) ?? 0n;
     const onchain = await rt.adapter.getBalance(rt.hotAddress, asset);
     const exp = explained.get(la) ?? 0n;
     rows.push({ chain, asset, ledger, onchain, explained: exp, drift: onchain - ledger - exp });

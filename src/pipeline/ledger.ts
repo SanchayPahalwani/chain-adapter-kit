@@ -98,7 +98,9 @@ export async function post(
   if (!row) return false;
 
   // Sorted by name, so two single posts touching the same accounts lock them in the same order.
-  // A transaction that makes several post calls should make them in a consistent order too.
+  // A transaction that makes several post calls should make them in a consistent order too: one
+  // that posts to two assets posts its native posting first, so that every such transaction locks
+  // custody(native) before any account of the other asset (settle posts the fee first for this).
   for (const account of [...delta.keys()].sort()) {
     await ensureAccount(tx, account, asset);
     try {

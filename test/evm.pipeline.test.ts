@@ -15,7 +15,7 @@ import {
   type PipelineEnv,
 } from './pipeline-suite.js';
 
-runPipelineSuite(makeEvmEnv);
+runPipelineSuite(makeEvmEnv, { underfundedWaitsIn: ['SIGNED', 'BROADCAST'] });
 
 describe('withdrawal pipeline on EVM', () => {
   let env: PipelineEnv;

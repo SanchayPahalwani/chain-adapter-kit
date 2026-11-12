@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { AssetId, ChainAdapter, TxStatus } from '../src/core/adapter.js';
-import { acct, ledgerAsset, post } from '../src/pipeline/ledger.js';
+import { acct, balance, ledgerAsset, post } from '../src/pipeline/ledger.js';
 import {
   formatReport,
   reconcile,
@@ -258,6 +258,46 @@ describe('reconciliation', () => {
       `${acct.custody(ledgerAsset(env.chain, token))}: 50`,
     );
     expect(r.ok).toBe(false);
+  });
+
+  it('Q10b custody_covered passes a requested asset with no account, and an uncovered one at 0', async () => {
+    const t = ledgerAsset(env.chain, token);
+    // requested, and no custody account for it yet: nothing to cover
+    expect(await balance(p.db, acct.custody(t))).toBe(0n);
+    const first = await run();
+    expect(row(first, token)).toMatchObject({ ledger: 0n, onchain: 0n, drift: 0n });
+    expect(check(first, 'custody_covered')).toEqual({
+      name: 'custody_covered',
+      ok: true,
+      detail: '',
+    });
+
+    // the account exists and is back at 0, and the token is not requested: nothing to cover
+    const move = (ref: string, from: string, to: string) =>
+      p.db.begin((tx) =>
+        post(tx, ref, 'test', t, [
+          { account: from, side: 'credit', amount: 5n },
+          { account: to, side: 'debit', amount: 5n },
+        ]),
+      );
+    await move('in', acct.platform(t), acct.custody(t));
+    await move('out', acct.custody(t), acct.platform(t));
+    expect(await p.db`select 1 from ledger_accounts where name = ${acct.custody(t)}`).toHaveLength(
+      1,
+    );
+    const second = await reconcile(p.db, p.deps.chains, { [env.chain]: ['native'] });
+    expect(failedChecks(second)).toEqual([]);
+    expect(second.ok).toBe(true);
+  });
+
+  it('Q10c custody balances are read by account name, whatever the asset column says', async () => {
+    const t = ledgerAsset(env.chain, token);
+    await p.db`
+      insert into ledger_accounts (name, asset, normal_side, balance)
+      values (${acct.custody(t)}, 'mislabelled', 'debit', 7)`;
+    const r = await reconcile(p.db, p.deps.chains, { [env.chain]: ['native'] });
+    expect(check(r, 'custody_covered').detail).toBe(`${acct.custody(t)}: 7`);
+    expect(row(await run(), token).ledger).toBe(7n);
   });
 
   it('Q11 an unbalanced entry fails debits_equal_credits', async () => {

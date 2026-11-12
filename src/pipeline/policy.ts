@@ -32,6 +32,9 @@ export function assertValidPolicy(p: AssetPolicy): void {
       `approvalsRequired must be between 1 and the ${p.approvers.length} approvers, got ${p.approvalsRequired}`,
     );
   }
+  // A name listed twice approves once, so the check above would pass an M no withdrawal can reach.
+  const twice = p.approvers.find((a, i) => p.approvers.indexOf(a) !== i);
+  if (twice !== undefined) throw new Error(`approver ${twice} is listed more than once`);
 }
 
 // The checks that run before the hold, in order; the first failure wins.

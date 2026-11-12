@@ -35,9 +35,12 @@ export async function hotWallet(adapter: ChainAdapter, signer: Signer): Promise<
 /**
  * One statement, so the row is chosen and leased atomically. skip locked: a row another
  * worker is claiming, or whose handler holds its row lock mid-transition, is passed over.
- * The lease only avoids duplicate work; the handlers stay correct without it.
+ * The lease only avoids duplicate work; the handlers stay correct without it. Only chains this
+ * worker has a runtime for: another chain's row would fail here and back off, delaying the
+ * worker that can run it.
  */
 export async function claim(deps: WorkerDeps, workerId: string): Promise<Withdrawal | null> {
+  const chains = Object.keys(deps.chains);
   const [row] = await deps.db`
     update withdrawals
        set lease_owner = ${workerId},
@@ -45,6 +48,7 @@ export async function claim(deps: WorkerDeps, workerId: string): Promise<Withdra
      where id = (
        select id from withdrawals
         where state in ('APPROVED','RESERVED','SIGNED','BROADCAST')
+          and chain = any(${chains}::text[])
           and next_run_at <= now()
           and (lease_expires_at is null or lease_expires_at < now())
         order by next_run_at
@@ -72,10 +76,13 @@ export async function runOnce(deps: WorkerDeps, workerId: string): Promise<boole
   // another worker claimed the row, that worker's lease is left alone.
   const { db } = deps;
   if (!failure) {
-    // handlers that want a delay have set next_run_at themselves
+    // Handlers that want a delay have set next_run_at themselves. A step that changed the state
+    // has happened, so an error from an earlier run of it is cleared; one that left the state
+    // as it was (track's poll) has written last_error itself.
     await db`
       update withdrawals set lease_owner = null, lease_expires_at = null, error_count = 0,
-             updated_at = now()
+             updated_at = now(),
+             last_error = case when state = ${w.state} then last_error end
        where id = ${w.id} and lease_owner = ${workerId}`;
   } else if (failure.error instanceof LostRace) {
     // another worker made this step; nothing to record

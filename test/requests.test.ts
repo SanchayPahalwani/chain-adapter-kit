@@ -194,6 +194,20 @@ describe('withdrawal requests', () => {
     expect(await userBal()).toBe(1000n);
   });
 
+  it('R6b FAILED withdrawals do not count toward the 24-hour limit; SETTLED ones do', async () => {
+    const failed = await submit('k6f', 500n);
+    const settled = await submit('k6s', 400n);
+    // what the worker leaves: the reverted one FAILED with its hold released, the other SETTLED
+    await t.db`update withdrawals set state = 'FAILED' where id = ${failed.id}`;
+    await t.db`update withdrawals set state = 'SETTLED' where id = ${settled.id}`;
+    const fits = await submit('k6g', 500n); // 400 + 500 of the 1000; with the FAILED one, 1400
+    expect([fits.state, fits.rejectReason]).toEqual(['AWAITING_APPROVAL', null]);
+    const over = await submit('k6h', 101n); // 400 + 500 + 101
+    expect([over.state, over.rejectReason]).toEqual(['REJECTED', 'over_24h_limit']);
+    const under = await submit('k6i', 100n); // 400 + 500 + 100
+    expect([under.state, under.rejectReason]).toEqual(['APPROVED', null]);
+  });
+
   it('R7 rejects when the balance is short, and writes the rejection', async () => {
     await fund('bob', 50n);
     await allowAddress(t.db, 'bob', CHAIN, '0xGOOD1');
@@ -342,6 +356,15 @@ describe('withdrawal requests', () => {
     expect(await count('approvals')).toBe(2);
   });
 
+  it('R17b an approval by an approver since removed from the policy no longer counts', async () => {
+    const w = await submit('k17b', 300n);
+    expect((await decide(w.id, 'ops1', 'approve')).state).toBe('AWAITING_APPROVAL');
+    const without = withPolicy({ approvers: ['ops2', 'ops3'] }); // ops1 removed, M still 2
+    expect((await decide(w.id, 'ops2', 'approve', without)).state).toBe('AWAITING_APPROVAL');
+    expect(await count('approvals')).toBe(2);
+    expect((await decide(w.id, 'ops3', 'approve', without)).state).toBe('APPROVED');
+  });
+
   it('R18 the same key used by two users gives two withdrawals', async () => {
     await fund('bob', 500n);
     await allowAddress(t.db, 'bob', CHAIN, '0xGOOD1');
@@ -391,6 +414,10 @@ describe('withdrawal requests', () => {
         /approvalsRequired must be between 1 and the 3 approvers/,
       );
     }
+    const twice = withPolicy({ approvers: ['ops1', 'ops2', 'ops1'] });
+    await expect(submitWithdrawal(t.db, twice, req('k21', 300n))).rejects.toThrow(
+      'approver ops1 is listed more than once',
+    );
     const unknown: RequestDeps = {
       ...deps,
       policy: (c, a) => {
@@ -433,6 +460,16 @@ describe('withdrawal requests', () => {
       }
     }
     expect([...outcomes].every((s) => s === 'APPROVED' || s === 'REJECTED')).toBe(true);
+  });
+
+  it('R23 a user id with a colon throws before anything is written', async () => {
+    // user:a:b:evm-anvil:native would read as user "a" and asset "b:evm-anvil:native"
+    await fund('a:b', 500n);
+    await allowAddress(t.db, 'a:b', CHAIN, '0xGOOD1');
+    await expect(submit('k23', 100n, { userId: 'a:b' })).rejects.toThrow(
+      `user id "a:b" contains ':', which account names use`,
+    );
+    expect(await count('withdrawals')).toBe(0);
   });
 
   it('R22 a decision on an unknown or malformed withdrawal id throws a clear error', async () => {

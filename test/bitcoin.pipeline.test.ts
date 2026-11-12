@@ -10,7 +10,7 @@ import {
   type PipelineEnv,
 } from './pipeline-suite.js';
 
-runPipelineSuite(makeBitcoinEnv);
+runPipelineSuite(makeBitcoinEnv, { underfundedWaitsIn: ['APPROVED'] });
 
 describe('withdrawal pipeline on Bitcoin', () => {
   let env: PipelineEnv;

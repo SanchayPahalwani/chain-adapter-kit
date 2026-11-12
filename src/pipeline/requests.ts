@@ -114,12 +114,13 @@ async function replay(tx: Tx, req: WithdrawalRequest): Promise<Withdrawal> {
   return w;
 }
 
-// Excludes the row being decided, which is already inserted.
+// Excludes the row being decided, which is already inserted, and withdrawals whose hold was
+// released or never placed: REJECTED, and FAILED (confirmed but reverted: nothing was sent).
 async function recentTotal(tx: Tx, w: Withdrawal): Promise<bigint> {
   const [row] = await tx<{ total: bigint }[]>`
     select coalesce(sum(amount), 0) as total from withdrawals
     where user_id = ${w.userId} and chain = ${w.chain} and asset = ${w.asset}
-      and id <> ${w.id} and state <> 'REJECTED'
+      and id <> ${w.id} and state not in ('REJECTED', 'FAILED')
       and created_at > now() - interval '24 hours'`;
   return row?.total ?? 0n;
 }
@@ -147,6 +148,12 @@ export async function submitWithdrawal(
   req: WithdrawalRequest,
 ): Promise<Withdrawal> {
   if (req.amount <= 0n) throw new RangeError(`amount must be positive, got ${req.amount}`);
+  // ledger account names are colon-separated (acct.user): a colon would make another user's name
+  if (req.userId.includes(':')) {
+    throw new RangeError(
+      `user id ${JSON.stringify(req.userId)} contains ':', which account names use`,
+    );
+  }
   const p = deps.policy(req.chain, req.asset);
   assertValidPolicy(p);
   return await db.begin(async (tx) => {
@@ -214,8 +221,11 @@ export async function decideApproval(
       ]);
       return setState(tx, w.id, 'AWAITING_APPROVAL', 'REJECTED', 'rejected_by_approver');
     }
+    // Only the approvers the policy names now: one removed since it approved no longer counts.
     const [c] = await tx<{ n: number }[]>`
-      select count(*)::int as n from approvals where withdrawal_id = ${w.id} and decision = 'approve'`;
+      select count(*)::int as n from approvals
+       where withdrawal_id = ${w.id} and decision = 'approve'
+         and approver_id = any(${p.approvers}::text[])`;
     if ((c?.n ?? 0) < p.approvalsRequired) return w;
     return setState(tx, w.id, 'AWAITING_APPROVAL', 'APPROVED', null);
   });

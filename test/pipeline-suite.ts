@@ -5,7 +5,7 @@ import { startMiner } from '../src/conformance/harness.js';
 import { LocalSigner } from '../src/core/local-signer.js';
 import { noCrash } from '../src/pipeline/crash.js';
 import type { Db } from '../src/pipeline/db.js';
-import { acct, balance, ledgerAsset } from '../src/pipeline/ledger.js';
+import { acct, balance, ledgerAsset, post } from '../src/pipeline/ledger.js';
 import { getWithdrawal, type Withdrawal, type WithdrawalState } from '../src/pipeline/requests.js';
 import { handlers, LostRace } from '../src/pipeline/steps.js';
 import {
@@ -13,6 +13,7 @@ import {
   hotWallet,
   runOnce,
   runWorker,
+  type ChainRuntime,
   type Timings,
   type WorkerDeps,
 } from '../src/pipeline/worker.js';
@@ -197,13 +198,31 @@ export async function twelveConcurrent(p: Pipeline, env: PipelineEnv): Promise<W
   return Promise.all(ws.map((w) => getWithdrawal(p.db, w.id)));
 }
 
-export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
+export interface SuiteOptions {
+  // Where a withdrawal from a hot wallet with nothing on-chain waits (F5): on EVM it is signed
+  // and sent, and the node refuses the transfer; on Bitcoin no coin can be reserved.
+  underfundedWaitsIn: WithdrawalState[];
+}
+
+export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>, options: SuiteOptions): void {
   let env: PipelineEnv;
   let p: Pipeline;
   const native = 'native';
   const n = () => ledgerAsset(env.chain, native);
   const state = async (id: string): Promise<WithdrawalState> =>
     (await getWithdrawal(p.db, id)).state;
+  const rowOf = async (id: string) => {
+    const [r] = await p.db<{ state: string; error_count: number; last_error: string | null }[]>`
+      select state, error_count, last_error from withdrawals where id = ${id}`;
+    if (!r) throw new Error(`withdrawal ${id} not found`);
+    return r;
+  };
+  // the ledger references posted for a withdrawal, such as hold:<id>
+  const postings = async (id: string) =>
+    (
+      await p.db<{ ref: string }[]>`
+        select ref from ledger_txs where ref like ${`%:${id}`} order by ref`
+    ).map((r) => r.ref);
 
   describe('withdrawal pipeline', () => {
     beforeAll(async () => {
@@ -558,13 +577,10 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
         expect(['APPROVED', 'RESERVED', 'SIGNED', 'BROADCAST']).toContain(await state(w.id));
         return elapsed();
       });
-      // Where it waits depends on the chain, so only "never terminal" is checked (above, at every
-      // step): on EVM it is signed and sent, and the node refuses the transfer; on Bitcoin the
-      // reservation finds no coin and the withdrawal stays APPROVED. Either failure is recorded
-      // on the row (a refused re-send too), not as an event per poll.
-      const [row] = await p.db<{ last_error: string | null }[]>`
-        select last_error from withdrawals where id = ${w.id}`;
-      expect(row?.last_error).toBeTruthy();
+      // Never terminal (above, at every step), waiting where this chain waits; either failure is
+      // recorded on the row (a refused re-send too), not as an event per poll.
+      expect(options.underfundedWaitsIn).toContain(await state(w.id));
+      expect((await rowOf(w.id)).last_error).toBeTruthy();
       expect(await eventsOf(p.db, w.id)).not.toContain('rebroadcast');
 
       await env.devnet.fund(p.hot.hotAddress, native, gasFloat(env) + amount);
@@ -583,7 +599,7 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       const b = await p.withdraw(native, amount);
       await runOnce(p.deps, 'one');
       expect(await state(b.id)).toBe('RESERVED');
-      // what a shared reservation would produce: byte-identical bytes, so the same txid
+      // as if two attempts had byte-identical signed bytes, so the same txid
       const deps = withMethods(p.deps, env, {
         attachSignatures: () => ({ txid: taken.txid, raw: taken.raw }),
       });
@@ -598,7 +614,7 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       const [row] = await p.db<
         { state: string; error_count: number; last_error: string | null; later: boolean }[]
       >`
-        select state, error_count, last_error, next_run_at > now() as later
+        select state, error_count, last_error, next_run_at > updated_at as later
           from withdrawals where id = ${b.id}`;
       expect(row?.state).toBe('RESERVED');
       expect(row?.error_count).toBe(1);
@@ -625,12 +641,7 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       };
       // the key behind the configured hot address rotated: same address, another key
       const rotated: WorkerDeps = { ...p.deps, signer: LocalSigner.random(), timings: stale };
-      const row = async () => {
-        const [r] = await p.db<{ state: string; error_count: number; last_error: string | null }[]>`
-          select state, error_count, last_error from withdrawals where id = ${w.id}`;
-        if (!r) throw new Error('no withdrawal');
-        return r;
-      };
+      const row = () => rowOf(w.id);
       for (const [deps, refusal] of [
         [restarted, /differs from the previous attempt/],
         [rotated, /not the sender|does not own the input/],
@@ -657,6 +668,152 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>): void {
       expect(done.settledTxid).toBe(first.txid);
       expect(await attemptsOf(p.db, w.id)).toHaveLength(1);
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it("a worker without a chain's runtime never claims that chain's rows", async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      const rt = p.deps.chains[env.chain];
+      if (!rt) throw new Error(`no runtime for ${env.chain}`);
+      for (const chains of [{}, { 'other-chain': rt }] as Record<string, ChainRuntime>[]) {
+        expect(await runOnce({ ...p.deps, chains }, 'elsewhere')).toBe(false);
+      }
+      const [row] = await p.db`
+        select state, lease_owner, error_count, last_error from withdrawals where id = ${w.id}`;
+      expect(row).toEqual({
+        state: 'APPROVED',
+        lease_owner: null,
+        error_count: 0,
+        last_error: null,
+      });
+      expect(await runOnce(p.deps, 'here')).toBe(true); // control: the runtime for its chain
+      expect(await state(w.id)).toBe('RESERVED');
+    });
+
+    it('a withdrawal that settles after a failed run shows no error', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      await toBroadcast(p.deps, w);
+      await env.devnet.mine(env.adapter.finalityDepth); // final: the next track run settles
+      let failures = 1;
+      const deps = withMethods(p.deps, env, {
+        getTxStatus: (txid) =>
+          failures-- > 0
+            ? Promise.reject(new Error('connect ECONNREFUSED (test)'))
+            : env.adapter.getTxStatus(txid),
+      });
+      await runOnce(deps, 'one');
+      expect(await rowOf(w.id)).toEqual({
+        state: 'BROADCAST',
+        error_count: 1,
+        last_error: 'connect ECONNREFUSED (test)',
+      });
+      // settle changes the state with no poll after it: the release clears the old error
+      await driveWithoutMining(deps, terminal(p.db, w.id));
+      expect(await rowOf(w.id)).toEqual({ state: 'SETTLED', error_count: 0, last_error: null });
+    });
+
+    it('two attempts reported confirmed: track fails on every run and settles nothing', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      await toBroadcast(p.deps, w);
+      // a replacement, stored and sent, so there are two attempts; nothing mined
+      const stale = { ...p.deps, timings: { ...p.deps.timings, stuckAfterMs: 0 } };
+      await driveWithoutMining(
+        stale,
+        async () =>
+          (await attemptsOf(p.db, w.id)).length === 2 && (await state(w.id)) === 'BROADCAST',
+      );
+      // the adapter breaks its promise that at most one attempt confirms
+      const tip = await env.adapter.getTip();
+      const deps = withMethods(p.deps, env, {
+        getTxStatus: () =>
+          Promise.resolve({
+            state: 'confirmed',
+            block: tip,
+            confirmations: env.adapter.finalityDepth,
+            succeeded: true,
+            feePaid: 1n,
+          }),
+      });
+      for (const runs of [1, 2]) {
+        // until it fails again, or (what must not happen) leaves BROADCAST
+        await driveWithoutMining(deps, async () => {
+          const r = await rowOf(w.id);
+          return r.error_count >= runs || r.state !== 'BROADCAST';
+        });
+        expect(await rowOf(w.id)).toMatchObject({
+          state: 'BROADCAST',
+          last_error: expect.stringMatching(/more than one attempt confirmed/) as string,
+        });
+      }
+      expect((await getWithdrawal(p.db, w.id)).settledTxid).toBeNull();
+      expect(await postings(w.id)).toEqual([`hold:${w.id}`]);
+    });
+
+    it('a broadcast whose attempt was replaced during the send records nothing: LostRace', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      await runOnce(p.deps, 'one');
+      await runOnce(p.deps, 'one');
+      expect(await state(w.id)).toBe('SIGNED');
+      // While this worker sends attempt 1, others record that broadcast and store a replacement,
+      // which leaves the withdrawal SIGNED with attempt 2 the latest. A stand-in for attempt 2
+      // will do: this test never sends it.
+      const deps = withMethods(p.deps, env, {
+        broadcast: async (tx: SignedTx) => {
+          const result = await env.adapter.broadcast(tx);
+          await p.db`
+            insert into tx_attempts (withdrawal_id, attempt_no, txid, raw, unsigned, fee)
+            select withdrawal_id, 2, 'stand-in-' || txid, raw, unsigned, fee from tx_attempts
+             where withdrawal_id = ${w.id} and attempt_no = 1`;
+          return result;
+        },
+      });
+
+      const thrown = await handlers
+        .SIGNED(deps, await getWithdrawal(p.db, w.id))
+        .catch((e: unknown) => e);
+      expect(thrown).toBeInstanceOf(LostRace);
+      expect(thrown).toMatchObject({ message: `attempt 1 of ${w.id} was replaced` });
+      // the transition rolled back with the attempt's update
+      expect(await state(w.id)).toBe('SIGNED');
+      const attempts = await attemptsOf(p.db, w.id);
+      expect(attempts.map((a) => [a.attempt_no, a.broadcast_at])).toEqual([
+        [1, null],
+        [2, null],
+      ]);
+      expect(await eventsOf(p.db, w.id)).toEqual(['APPROVED>RESERVED', 'RESERVED>SIGNED']);
+    });
+
+    it('a settlement already posted makes settle fail and roll back, never post twice', async () => {
+      const amount = env.unit(native);
+      await p.credit(native, amount);
+      const w = await p.withdraw(native, amount);
+      await toBroadcast(p.deps, w);
+      await env.devnet.mine(env.adapter.finalityDepth); // final: the next track run settles
+      // a posting under this withdrawal's settle reference, which only a second settle could meet
+      const a = n();
+      await p.db.begin((tx) =>
+        post(tx, `settle:${w.id}`, 'settle', a, [
+          { account: acct.inFlight(a), side: 'debit', amount },
+          { account: acct.custody(a), side: 'credit', amount },
+        ]),
+      );
+
+      expect(await runOnce(p.deps, 'one')).toBe(true);
+      expect(await rowOf(w.id)).toEqual({
+        state: 'BROADCAST',
+        error_count: 1,
+        last_error: `settle:${w.id} was already posted`,
+      });
+      // the fee, posted before it in the same transaction, rolled back with it
+      expect(await postings(w.id)).toEqual([`hold:${w.id}`, `settle:${w.id}`]);
+      expect((await getWithdrawal(p.db, w.id)).settledTxid).toBeNull();
     });
 
     it('F6 attempts stop at maxAttempts', async () => {

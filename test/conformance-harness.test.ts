@@ -8,6 +8,7 @@ function fakeDevnet(mine: () => Promise<void>): Devnet {
     fund: async () => {},
     dropFromMempool: async () => {},
     reorg: async () => {},
+    pendingFrom: async () => 0,
   };
 }
 

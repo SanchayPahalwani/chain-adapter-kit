@@ -10,6 +10,8 @@ export interface Devnet {
   mine(blocks: number): Promise<void>;
   dropFromMempool(txid: string): Promise<void>;
   reorg(depth: number): Promise<void>;
+  /** The number of transactions from `address` the node holds but has not mined, including ones it cannot mine yet. */
+  pendingFrom(address: string): Promise<number>;
 }
 
 /** Everything the conformance suite knows about a chain. */

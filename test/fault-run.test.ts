@@ -15,6 +15,7 @@ import {
   spawnWorker,
   superviseUntilDone,
   type Run,
+  type Supervised,
   type WorkerOptions,
 } from '../scripts/lib/supervisor.js';
 import { drive, eventsOf, openPipeline } from './pipeline-suite.js';
@@ -70,14 +71,14 @@ describe('fault run', () => {
   it('X1 killOnce kills a child process once per withdrawal and point', PROCESS_TEST, async () => {
     const ws = await twoNative();
     const stopMiner = startMiner(env.devnet, 100);
-    let kills: number;
+    let supervised: Supervised;
     try {
-      kills = await superviseUntilDone(run, { crashAt: 'after_broadcast', timings }, 40_000);
+      supervised = await superviseUntilDone(run, { crashAt: 'after_broadcast', timings }, 40_000);
     } finally {
       await stopMiner();
     }
 
-    expect(kills).toBe(2);
+    expect(supervised).toEqual({ kills: 2, timedOut: false });
     const injected = await crashEvents(box.db);
     expect(injected.map((e) => e.point)).toEqual(['after_broadcast', 'after_broadcast']);
     expect(new Set(injected.map((e) => e.withdrawal_id))).toEqual(new Set(ws.map((w) => w.id)));
@@ -160,7 +161,12 @@ describe('fault run', () => {
       // a restarted worker signs again from the stored reservation and finishes the job
       const stopMiner = startMiner(env.devnet, 100);
       try {
-        await superviseUntilDone(run, { crashAt: 'after_sign', timings }, 40_000);
+        const supervised = await superviseUntilDone(
+          run,
+          { crashAt: 'after_sign', timings },
+          40_000,
+        );
+        expect(supervised.timedOut).toBe(false);
       } finally {
         await stopMiner();
       }

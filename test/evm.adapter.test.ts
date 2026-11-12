@@ -325,6 +325,20 @@ describe('EVM adapter broadcast against anvil', () => {
     });
   });
 
+  it('pendingFrom also counts a transaction waiting behind a nonce gap', async () => {
+    const from = await wallet();
+    await devnet.fund(from.address, 'native', 10n ** 18n);
+    const store = new MemoryInputStore(); // one store: nonces n and n + 1
+    const first = await signedTransfer(from, store);
+    const second = await signedTransfer(from, store);
+    expect(await adapter.broadcast(second)).toEqual({ outcome: 'accepted' }); // queued: n is missing
+    expect(await devnet.pendingFrom(from.address)).toBe(1);
+    expect(await adapter.broadcast(first)).toEqual({ outcome: 'accepted' });
+    expect(await devnet.pendingFrom(from.address)).toBe(2);
+    await devnet.mine(1);
+    expect(await devnet.pendingFrom(from.address)).toBe(0);
+  });
+
   it('buildReplacement keeps every field but the fees, and bumps each by at least one eighth', async () => {
     const from = await wallet();
     const high = {

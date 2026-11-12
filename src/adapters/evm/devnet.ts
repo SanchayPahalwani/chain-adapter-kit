@@ -44,6 +44,12 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
     throw new Error(`refusing chain id ${chainId}: only a local anvil (${foundry.id}) is allowed`);
   }
 
+  // viem has no wrapper for anvil_reorg or txpool_inspect
+  const request = client.request as (args: {
+    method: string;
+    params: unknown[];
+  }) => Promise<unknown>;
+
   // The nonce is read from the node before every send, with the `pending` tag: under
   // --no-mining a send from this account can still be in the pool (one an interrupted
   // earlier run left behind), and `latest` would hand out its nonce again. Passing it
@@ -96,12 +102,24 @@ export async function createEvmDevnet(rpcUrl: string): Promise<EvmDevnet> {
     // Replaces the last `depth` blocks with empty ones at the same heights. Their
     // transactions are gone, not back in the pool; what was in the pool stays there.
     async reorg(depth: number) {
-      // viem has no wrapper for anvil_reorg
-      const request = client.request as (args: {
-        method: string;
-        params: unknown[];
-      }) => Promise<unknown>;
       await request({ method: 'anvil_reorg', params: [depth, []] });
+    },
+
+    // txpool_inspect answers { pending: { sender: { nonce: summary } }, queued: { ... } }:
+    // `pending` can be mined now, `queued` waits behind a nonce gap. Both count.
+    async pendingFrom(address: string) {
+      const pool = (await request({ method: 'txpool_inspect', params: [] })) as Record<
+        'pending' | 'queued',
+        Record<string, Record<string, string>>
+      >;
+      const sender = getAddress(address);
+      let n = 0;
+      for (const bySender of [pool.pending, pool.queued]) {
+        for (const [from, byNonce] of Object.entries(bySender)) {
+          if (getAddress(from) === sender) n += Object.keys(byNonce).length;
+        }
+      }
+      return n;
     },
 
     async deployTestToken() {

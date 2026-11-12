@@ -24,6 +24,7 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     fund: (address, asset, amount) => base.fund(address, asset, amount),
     dropFromMempool: (txid) => base.dropFromMempool(txid),
     reorg: (depth) => base.reorg(depth),
+    pendingFrom: (address) => base.pendingFrom(address),
     async mine(blocks) {
       if (!stuck) return base.mine(blocks);
       for (let i = 0; i < blocks; i++) {
@@ -41,7 +42,7 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
     freshAddress: async () =>
       adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
-    workerEnv: { KIT_EVM_TOKENS: token },
+    workerEnv: { KIT_EVM_TOKENS: token, KIT_EVM_FINALITY_DEPTH: String(adapter.finalityDepth) },
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
     async makeStuck() {
       stuck = true;

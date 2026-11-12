@@ -34,10 +34,11 @@ export function spawnWorker(run: Run, opts: WorkerOptions): ChildProcess {
   };
   if (opts.crashAt) env.KIT_CRASH_AT = opts.crashAt;
   else delete env.KIT_CRASH_AT;
+  // 'ipc': if this process dies, the channel closes and the worker stops itself (worker-main.ts)
   return spawn(process.execPath, ['--import', 'tsx', workerMain], {
     cwd: root,
     env,
-    stdio: ['ignore', run.logFd, run.logFd],
+    stdio: ['ignore', run.logFd, run.logFd, 'ipc'],
   });
 }
 
@@ -49,37 +50,66 @@ async function unfinished(db: Db): Promise<number> {
 
 const running = (child: ChildProcess) => child.exitCode === null && child.signalCode === null;
 
+type Exit = [code: number | null, signal: NodeJS.Signals | null];
+
+const STOP_GRACE_MS = 10_000;
+
+// SIGTERM, then up to STOP_GRACE_MS for the worker to finish its step and exit. A worker that
+// takes longer is killed, and the run fails.
+async function stop(child: ChildProcess, exit: Promise<Exit>): Promise<Exit> {
+  child.kill('SIGTERM');
+  const timer = new AbortController();
+  const late = sleep(STOP_GRACE_MS, null, { signal: timer.signal }).catch(() => null);
+  const result = await Promise.race([exit, late]);
+  timer.abort();
+  if (result) return result;
+  child.kill('SIGKILL');
+  await exit;
+  throw new Error(`worker did not stop within ${STOP_GRACE_MS / 1000} s of SIGTERM`);
+}
+
+export interface Supervised {
+  kills: number; // workers that died by SIGKILL, which only a crash hook sends
+  timedOut: boolean; // the deadline passed with withdrawals still unfinished
+}
+
 /**
- * Runs one worker at a time until every withdrawal in the sandbox is terminal or `timeoutMs` has
- * passed, starting a new worker each time one dies. Then stops the live one with SIGTERM.
- * Returns how many died by SIGKILL, which only a crash hook sends. Any other exit throws.
+ * Runs one worker at a time until every withdrawal in the sandbox is terminal, `timeoutMs` has
+ * passed or `signal` aborts, starting a new worker each time one dies; then stops the live one.
+ * Any other exit of a worker throws, and so does an abort, once the live worker has stopped.
  */
 export async function superviseUntilDone(
   run: Run,
   opts: WorkerOptions,
   timeoutMs: number,
-): Promise<number> {
+  signal?: AbortSignal,
+): Promise<Supervised> {
   const deadline = Date.now() + timeoutMs;
+  const done = async () => (await unfinished(run.box.db)) === 0;
   let kills = 0;
-  while ((await unfinished(run.box.db)) > 0 && Date.now() < deadline) {
+  for (;;) {
+    if (signal?.aborted) throw new Error('interrupted');
+    if (await done()) return { kills, timedOut: false };
+    if (Date.now() >= deadline) return { kills, timedOut: true };
     const child = spawnWorker(run, opts);
-    const exit = once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>;
-    let stopping = false;
+    const exit = once(child, 'exit') as Promise<Exit>;
     try {
-      while (running(child)) {
-        if ((await unfinished(run.box.db)) === 0 || Date.now() >= deadline) {
-          stopping = true;
-          child.kill('SIGTERM');
-          break;
+      let stopped: Exit | undefined;
+      while (running(child) && !stopped) {
+        if (signal?.aborted || Date.now() >= deadline || (await done())) {
+          stopped = await stop(child, exit);
+        } else {
+          await sleep(100);
         }
-        await sleep(100);
       }
-      const [code, signal] = await exit;
-      if (signal === 'SIGKILL') {
+      const [code, sig] = stopped ?? (await exit);
+      if (sig === 'SIGKILL') {
         kills++;
-      } else if (!stopping) {
-        throw new Error(`a worker exited by itself (${signal ?? `code ${code}`})`);
-      } else if (code !== 0 && signal !== 'SIGTERM') {
+      } else if (signal?.aborted) {
+        continue; // a Ctrl-C reaches the worker too, and it stops itself
+      } else if (!stopped) {
+        throw new Error(`a worker exited by itself (${sig ?? `code ${code}`})`);
+      } else if (code !== 0 && sig !== 'SIGTERM') {
         // a SIGTERM that lands before the worker installs its handler ends it by the signal
         throw new Error(`a worker stopped with code ${code}`);
       }
@@ -87,5 +117,4 @@ export async function superviseUntilDone(
       if (running(child)) child.kill('SIGKILL'); // only if this function itself failed
     }
   }
-  return kills;
 }

@@ -267,5 +267,14 @@ export function runConformanceSuite(
         ).not.toContain(signed.txid);
       }
     });
+
+    it('C16 pendingFrom counts what the node holds from a sender until it is mined', async () => {
+      const { from, signed } = await transfer(native());
+      expect(await h.devnet.pendingFrom(from.address)).toBe(0);
+      expect(await h.adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+      expect(await h.devnet.pendingFrom(from.address)).toBe(1);
+      await h.devnet.mine(1);
+      expect(await h.devnet.pendingFrom(from.address)).toBe(0);
+    });
   });
 }

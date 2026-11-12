@@ -76,14 +76,17 @@ export interface Sandbox extends TestDb {
 }
 
 export interface SandboxOptions {
-  // false: the ledger is funded as usual, but nothing (gas float or deposits) reaches the hot
+  // false: the ledger is funded as usual, but nothing (floats or deposits) reaches the hot
   // wallet on-chain, so it cannot pay until the caller funds it with env.devnet.fund
   fundOnChain?: boolean;
+  // true: the hot wallet also holds a platform-owned float of every token, booked like the gas
+  // float, so a duplicated token transfer lands at its destination instead of reverting
+  tokenFloat?: boolean;
 }
 
 export async function openSandbox(
   env: PipelineEnv,
-  { fundOnChain = true }: SandboxOptions = {},
+  { fundOnChain = true, tokenFloat = false }: SandboxOptions = {},
 ): Promise<Sandbox> {
   const t = await createTestDb();
   try {
@@ -95,15 +98,20 @@ export async function openSandbox(
         chain === env.chain && env.adapter.validateAddress(address),
     };
     const userId = `user-${randomUUID()}`;
-    const n = ledgerAsset(env.chain, 'native');
-    const gas = gasFloat(env);
-    if (fundOnChain) await env.devnet.fund(hot.hotAddress, 'native', gas);
-    await t.db.begin((tx) =>
-      post(tx, `fund:${hot.hotAddress}`, 'fund', n, [
-        { account: acct.custody(n), side: 'debit', amount: gas },
-        { account: acct.platform(n), side: 'credit', amount: gas },
-      ]),
-    );
+    const floats: [AssetId, bigint][] = [['native', gasFloat(env)]];
+    if (tokenFloat) {
+      for (const token of env.assets.slice(1)) floats.push([token, 100n * env.unit(token)]);
+    }
+    for (const [asset, amount] of floats) {
+      const a = ledgerAsset(env.chain, asset);
+      if (fundOnChain) await env.devnet.fund(hot.hotAddress, asset, amount);
+      await t.db.begin((tx) =>
+        post(tx, `fund:${hot.hotAddress}:${asset}`, 'fund', a, [
+          { account: acct.custody(a), side: 'debit', amount },
+          { account: acct.platform(a), side: 'credit', amount },
+        ]),
+      );
+    }
     let deposits = 0;
     const allowFresh = async () => {
       const to = await env.freshAddress();

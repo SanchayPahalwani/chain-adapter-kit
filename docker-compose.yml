@@ -27,3 +27,22 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # Credentials kit/kit are test-only: regtest, published on 127.0.0.1 only. No volume, so
+  # `make down` resets the chain.
+  bitcoind:
+    build: docker/bitcoind
+    image: chain-adapter-kit-bitcoind:32.1
+    network_mode: bridge
+    command: >-
+      -regtest -server -txindex=1 -fallbackfee=0.0002
+      -rpcbind=0.0.0.0 -rpcallowip=0.0.0.0/0 -rpcuser=kit -rpcpassword=kit
+      -connect=0 -listen=0 -listenonion=0 -printtoconsole
+    ports:
+      - '127.0.0.1:58443:18443'
+    healthcheck:
+      test:
+        ['CMD', 'bitcoin-cli', '-regtest', '-rpcuser=kit', '-rpcpassword=kit', 'getblockchaininfo']
+      interval: 2s
+      timeout: 3s
+      retries: 30

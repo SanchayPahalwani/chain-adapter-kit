@@ -4,7 +4,7 @@ node_modules: package-lock.json
 	npm ci
 
 up:
-	docker compose up -d --wait
+	docker compose up -d --build --wait
 
 down:
 	docker compose down -v

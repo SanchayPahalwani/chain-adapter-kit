@@ -1,166 +1,42 @@
-// Kills a worker process with SIGKILL at each named crash point, restarts it, and grades every
-// withdrawal by what its destination holds on the chain (spec section 11). One line per scenario
-// and a summary; exit code 1 if any scenario fails.
+// Runs the fault-injection scenarios (scripts/lib/scenarios.ts) one after another, each on its own
+// sandbox, and grades every withdrawal by what its destination holds on the chain (spec section
+// 11). One line per scenario, then the table; docs/results.md is written only when every scenario
+// passed. Exit code 1 if any failed, 130 if interrupted.
 //
-//   npx tsx scripts/fault-run.ts [--quick | --per-scenario <n>] [--only <crash point>] [--keep]
+//   npx tsx scripts/fault-run.ts [--quick | --per-scenario <n>] [--only <name>,...] [--keep]
+//                                [--json] [--no-write]
 //
-// --quick: 2 withdrawals per scenario (default 10). --keep: keep each scenario's schema and log.
-import { closeSync, openSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+// --quick: 2 withdrawals per scenario (default 10), and 10 for random_kills (default 100).
+// --only: scenario names: a crash point, random_kills, duplicate_requests, dropped_tx, reorg,
+// stuck_fee. --keep: keep each scenario's schema and log. --json: the results as one JSON document
+// on stdout, and nothing else there. --no-write: leave docs/results.md as it is.
+import { closeSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { startMiner } from '../src/conformance/harness.js';
-import { crashPoints, isCrashPoint, type CrashPoint } from '../src/pipeline/crash.js';
-import type { Db } from '../src/pipeline/db.js';
-import { reconcile } from '../src/pipeline/reconcile.js';
-import { verifyAgainstChain, type Verdict } from '../src/pipeline/verify.js';
-import type { PipelineEnv } from './lib/env.js';
+import { config } from '../src/config.js';
+import { connect } from '../src/pipeline/db.js';
 import { makeEvmEnv } from './lib/evm-env.js';
-import { openSandbox } from './lib/sandbox.js';
 import {
-  superviseUntilDone,
-  type Run,
-  type Supervised,
-  type WorkerOptions,
-} from './lib/supervisor.js';
-import { byDeadline, seconds, startMinerWhen } from './lib/waits.js';
+  commitOf,
+  RESULTS_PATH,
+  resultsMarkdown,
+  table,
+  totalsOf,
+  type Outcome,
+  type Totals,
+} from './lib/results.js';
+import { scenarios, setup, type Graded } from './lib/scenarios.js';
+import { seconds } from './lib/waits.js';
 
-interface ScenarioResult {
-  name: string;
-  kills: number;
-  verdict: Verdict;
-  drift: bigint; // the largest absolute reconciliation drift over the scenario's assets
-  problems: string[]; // why the scenario failed, failed reconciliation checks included
-}
-
-interface FaultRun extends Run {
-  env: PipelineEnv;
-  logPath: string;
-}
-
-// A short lease, so the lease a killed worker leaves behind soon expires. A stuck threshold long
-// enough that nothing is replaced unless a scenario holds the blocks back.
-const timings: WorkerOptions['timings'] = {
-  leaseMs: 1000,
-  pollMs: 50,
-  stuckAfterMs: 20_000,
-  maxAttempts: 5,
-};
-const MINE_EVERY_MS = 100;
-const timeoutFor = (n: number) => 30_000 + 10_000 * n; // the whole scenario, grading included
-const GRADING_MS = 20_000; // the end of each scenario's time, kept for grading
-
-// A fresh schema, seed and hot wallet funded on-chain and in the ledger, a credited user and the
-// policy (scripts/lib/sandbox.ts), and one file for the output of all the scenario's workers.
-// The token float lets a duplicated token transfer land, so it shows as sent twice.
-async function setup(env: PipelineEnv): Promise<FaultRun> {
-  const box = await openSandbox(env, { tokenFloat: true });
-  const logPath = join(tmpdir(), `fault-run-${box.schema}.log`);
-  return { env, box, logPath, logFd: openSync(logPath, 'w') };
-}
-
-// Alternates the assets, each withdrawal to its own fresh allowlisted address and for its own
-// amount, so a transfer sent to the wrong destination shows as one sent twice and one lost.
-async function submitMany(run: FaultRun, n: number): Promise<string[]> {
-  const { env, box } = run;
-  const plan = Array.from({ length: n }, (_, i) => {
-    const asset = env.assets[i % env.assets.length] ?? 'native';
-    return { asset, amount: env.unit(asset) + BigInt(i) };
-  });
-  for (const asset of env.assets) {
-    const total = plan.filter((w) => w.asset === asset).reduce((sum, w) => sum + w.amount, 0n);
-    if (total > 0n) await box.credit(asset, total);
-  }
-  const ids: string[] = [];
-  for (const w of plan) ids.push((await box.withdraw(w.asset, w.amount)).id);
-  return ids;
-}
-
-async function everyHasSecondAttempt(db: Db): Promise<boolean> {
-  const [row] = await db<{ n: number }[]>`
-    select count(*)::int as n from withdrawals w
-     where (select count(*) from tx_attempts t where t.withdrawal_id = w.id) < 2`;
-  return row?.n === 0;
-}
-
-// Reads the chain only once nothing more can change on it: whatever the workers sent is mined in
-// and final, and the node holds nothing else from the hot wallet. A transaction still held (one
-// behind a nonce gap, say) could move money after the balances were read.
-async function grade(run: FaultRun, point: CrashPoint) {
-  const { env, box } = run;
-  await env.devnet.mine(env.adapter.finalityDepth + 1);
-  const left = await env.devnet.pendingFrom(box.hot.hotAddress);
-  const verdict = await verifyAgainstChain(box.db, box.chains);
-  const report = await reconcile(box.db, box.chains, { [env.chain]: env.assets });
-  const [row] = await box.db<{ n: number }[]>`
-    select count(distinct withdrawal_id)::int as n from withdrawal_events
-     where kind = 'crash_injected' and data->>'point' = ${point}`;
-  return { left, verdict, report, injected: row?.n ?? 0 };
-}
-
-// One worker at a time, each started with `point` switched on. Each withdrawal kills a worker
-// there once (killOnce), and the next worker carries on from what had been committed.
-async function killAt(
-  run: FaultRun,
-  point: CrashPoint,
-  n: number,
-  interrupt: AbortSignal,
-): Promise<ScenarioResult> {
-  const { env, box } = run;
-  const started = Date.now();
-  const deadline = started + timeoutFor(n);
-  const ids = await submitMany(run, n);
-  // A replacement is made only for a transaction still unconfirmed after stuckAfterMs, so this
-  // scenario holds the blocks back until every withdrawal has its second attempt.
-  const replacing = point === 'after_replacement_store';
-  const stuckAfterMs = replacing ? 1500 : timings.stuckAfterMs;
-  const opts: WorkerOptions = { crashAt: point, timings: { ...timings, stuckAfterMs } };
-  const stopMiner = replacing
-    ? startMinerWhen(env.devnet, MINE_EVERY_MS, () => everyHasSecondAttempt(box.db))
-    : startMiner(env.devnet, MINE_EVERY_MS);
-  let supervised: Supervised;
-  try {
-    const supervising = deadline - GRADING_MS - Date.now();
-    supervised = await superviseUntilDone(run, opts, supervising, interrupt);
-  } finally {
-    await stopMiner();
-  }
-  const { kills, timedOut } = supervised;
-  const problems: string[] = [];
-  if (timedOut) problems.push(`timed out after ${seconds(started)} s`);
-  const { left, verdict, report, injected } = await byDeadline(
-    deadline,
-    started,
-    grade(run, point),
-  );
-
-  const abs = (x: bigint) => (x < 0n ? -x : x);
-  const drift = report.rows.reduce((max, r) => (abs(r.drift) > max ? abs(r.drift) : max), 0n);
-  const { sentTwice, lost, unfinished, settled } = verdict;
-  if (left > 0) problems.push(`transactions left in the mempool: ${left}`);
-  if (sentTwice + lost + unfinished > 0) problems.push('sent twice, lost or unfinished');
-  // every withdrawal here is valid and funded: a crash must not change how one ends
-  if (settled !== ids.length) problems.push(`${settled} of ${ids.length} withdrawals settled`);
-  if (drift !== 0n) problems.push(`reconciliation drift ${drift}`);
-  for (const c of report.checks.filter((c) => !c.ok)) {
-    problems.push(`reconciliation check ${c.name}: ${c.detail}`);
-  }
-  if (kills !== injected) problems.push(`${kills} kills, ${injected} crash_injected withdrawals`);
-  if (kills < ids.length) problems.push(`${kills} kills for ${ids.length} withdrawals`);
-  return { name: `kill at ${point}`, kills, verdict, drift, problems };
-}
-
-const line = (r: ScenarioResult) => {
-  const v = r.verdict;
-  return (
-    `${r.name}: ${v.withdrawals} withdrawals, ${r.kills} kills, ${v.settled} settled, ` +
-    `sent twice ${v.sentTwice}, lost ${v.lost}, unfinished ${v.unfinished}, drift ${r.drift}`
-  );
-};
+const root = fileURLToPath(new URL('../', import.meta.url));
 
 function usage(message: string): never {
   console.error(message);
-  console.error('usage: fault-run.ts [--quick | --per-scenario <n>] [--only <point>] [--keep]');
+  console.error(
+    'usage: fault-run.ts [--quick | --per-scenario <n>] [--only <name>,...] [--keep] [--json] ' +
+      '[--no-write]',
+  );
   process.exit(2);
 }
 
@@ -170,86 +46,167 @@ const { values: args } = parseArgs({
     'per-scenario': { type: 'string' },
     only: { type: 'string' },
     keep: { type: 'boolean', default: false },
+    json: { type: 'boolean', default: false },
+    'no-write': { type: 'boolean', default: false },
   },
 });
 if (args.quick && args['per-scenario'] !== undefined) usage('--quick or --per-scenario, not both');
 const n = args.quick ? 2 : Number(args['per-scenario'] ?? 10);
 if (!Number.isInteger(n) || n < 1) usage(`--per-scenario must be a positive integer`);
-if (args.only !== undefined && !isCrashPoint(args.only)) usage(`unknown crash point ${args.only}`);
-const points: readonly CrashPoint[] = args.only !== undefined ? [args.only] : crashPoints;
+const only = args.only?.split(',').map((s) => s.trim());
+for (const name of only ?? []) {
+  if (!scenarios.some((s) => s.name === name)) usage(`unknown scenario ${name}`);
+}
+const selected = only ? scenarios.filter((s) => only.includes(s.name)) : scenarios;
+// with --json, stdout carries the JSON document only
+const say = args.json ? console.error : console.log;
 
-// Ctrl-C or SIGTERM: the current scenario stops its worker and its miner and drops its schema
-// (unless --keep), then the run exits 130. Later signals are ignored while it cleans up: under
-// `npx tsx` one Ctrl-C arrives twice, from the terminal and relayed by tsx.
+// Ctrl-C or SIGTERM: the current scenario stops its workers and its miner and drops its schema
+// (unless --keep), then the run exits 130. Under `npx tsx` one Ctrl-C arrives twice, from the
+// terminal and relayed by tsx, so a second signal counts only a second after the first: then the
+// run exits at once, cleanup or not.
 const interrupt = new AbortController();
+let interruptedAt = 0;
 const onSignal = () => {
-  if (interrupt.signal.aborted) return;
-  console.error('interrupted: stopping the worker, then cleaning up');
-  interrupt.abort();
+  if (!interrupt.signal.aborted) {
+    interruptedAt = Date.now();
+    console.error('interrupted: stopping the workers, then cleaning up (again to exit now)');
+    interrupt.abort();
+  } else if (Date.now() - interruptedAt > 1000) {
+    writeSync(2, 'interrupted again: exiting without cleaning up\n'); // before the exit, unlike console
+    process.exit(130);
+  }
 };
 process.on('SIGINT', onSignal);
 process.on('SIGTERM', onSignal);
 
 const started = Date.now();
+const commit = commitOf(root);
+const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const env = await makeEvmEnv();
-const results: ScenarioResult[] = [];
+
+const line = (title: string, g: Graded) => {
+  const v = g.verdict;
+  return (
+    `${g.problems.length > 0 ? 'FAILED: ' : ''}${title}: ${v.withdrawals} withdrawals, ` +
+    `${g.kills} kills, ${v.settled} settled, ${v.rejected} rejected, sent twice ${v.sentTwice}, ` +
+    `lost ${v.lost}, unfinished ${v.unfinished}, drift ${g.drift}`
+  );
+};
+
+const outcomes: Outcome[] = [];
 let failures = 0;
-let unfinishedScenarios = 0;
-for (const point of points) {
-  if (interrupt.signal.aborted) break;
-  const run = await setup(env);
-  let result: ScenarioResult | Error;
-  try {
-    result = await killAt(run, point, n, interrupt.signal);
-  } catch (error) {
-    result = error instanceof Error ? error : new Error(String(error));
-  } finally {
+async function runAll() {
+  for (const s of selected) {
+    if (interrupt.signal.aborted) break;
+    const count = s.withdrawals ? s.withdrawals[args.quick ? 'quick' : 'full'] : n;
+    const run = await setup(env);
+    const outcome: Outcome = { name: s.name, title: s.title, about: s.about };
+    try {
+      outcome.graded = await s.run(run, count, interrupt.signal);
+    } catch (error) {
+      outcome.error = error instanceof Error ? error.message : String(error);
+    }
     closeSync(run.logFd);
-    await run.box.close({ keepSchema: args.keep });
+    let cleanup: string | undefined;
+    try {
+      await run.box.close({ keepSchema: args.keep });
+    } catch (error) {
+      cleanup = `could not drop schema ${run.box.schema}: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (interrupt.signal.aborted) {
+      if (cleanup) console.error(cleanup);
+      if (!args.keep) rmSync(run.logPath, { force: true });
+      break;
+    }
+    const kept = args.keep ? ` (kept schema ${run.box.schema}, log ${run.logPath})` : '';
+    if (outcome.graded) {
+      say(line(s.title, outcome.graded) + kept);
+      for (const p of outcome.graded.problems) console.error(`  FAILED: ${p}`);
+    } else {
+      say(`FAILED: ${s.title}: did not finish: ${outcome.error}${kept}`);
+    }
+    if (cleanup) console.error(`  FAILED: ${cleanup}`);
+    outcomes.push(outcome);
+    if (!outcome.graded || outcome.graded.problems.length > 0 || cleanup) {
+      failures++;
+      console.error(`  worker log: ${run.logPath}`);
+    } else if (!args.keep) {
+      rmSync(run.logPath);
+    }
   }
-  if (interrupt.signal.aborted) {
-    if (!args.keep) rmSync(run.logPath);
-    break;
-  }
-  const kept = args.keep ? ` (kept schema ${run.box.schema}, log ${run.logPath})` : '';
-  if (result instanceof Error) {
-    unfinishedScenarios++;
-    console.error(`kill at ${point}: did not finish: ${result.message}${kept}`);
-  } else {
-    results.push(result);
-    console.log(line(result) + kept);
-    for (const p of result.problems) console.error(`  FAILED: ${p}`);
-  }
-  if (result instanceof Error || result.problems.length > 0) {
-    failures++;
-    console.error(`  worker log: ${run.logPath}`);
-  } else if (!args.keep) {
-    rmSync(run.logPath);
-  }
-}
-if (interrupt.signal.aborted) {
-  console.error('interrupted');
-  process.exit(130);
 }
 
-// Totals only over every scenario: a summary that left a failed one out would read cleaner than
-// the run was.
-const sum = (f: (r: ScenarioResult) => number) => results.reduce((s, r) => s + f(r), 0);
-const maxDrift = results.reduce((max, r) => (r.drift > max ? r.drift : max), 0n);
-const totals =
-  `${sum((r) => r.verdict.withdrawals)} withdrawals, ${sum((r) => r.kills)} kills, ` +
-  `${sum((r) => r.verdict.settled)} settled, sent twice ${sum((r) => r.verdict.sentTwice)}, ` +
-  `lost ${sum((r) => r.verdict.lost)}, unfinished ${sum((r) => r.verdict.unfinished)}, ` +
-  `drift ${maxDrift}`;
-const took = `(${seconds(started)} s)`;
-if (failures === 0) {
-  console.log(`all ${points.length} scenarios passed: ${totals} ${took}`);
-} else if (unfinishedScenarios > 0) {
-  console.log(
-    `FAILED: ${failures} of ${points.length} scenarios, ${unfinishedScenarios} of them ` +
-      `did not finish, so there are no totals ${took}`,
-  );
-} else {
-  console.log(`FAILED: ${failures} of ${points.length} scenarios: ${totals} ${took}`);
+// Totals only over every scenario: a summary that left an unfinished one out would read cleaner
+// than the run was.
+async function report() {
+  const graded = outcomes.flatMap((o) => (o.graded ? [o.graded] : []));
+  const totals: Totals | null = graded.length === outcomes.length ? totalsOf(graded) : null;
+  const took = seconds(started);
+  const summary = totals
+    ? `${totals.withdrawals} withdrawals, ${totals.kills} kills, ${totals.settled} settled, ` +
+      `${totals.rejected} rejected, sent twice ${totals.sentTwice}, lost ${totals.lost}, ` +
+      `unfinished ${totals.unfinished}, drift ${totals.drift}`
+    : `${outcomes.length - graded.length} did not finish, so there are no totals`;
+  if (failures === 0) say(`all ${selected.length} scenarios passed: ${summary} (${took} s)`);
+  else say(`FAILED: ${failures} of ${selected.length} scenarios: ${summary} (${took} s)`);
+
+  if (args.json) {
+    const doc = {
+      passed: failures === 0,
+      seconds: took,
+      scenarios: outcomes.map(({ name, title, graded: g, error }) =>
+        g
+          ? {
+              name,
+              title,
+              finished: true,
+              ...g.verdict,
+              kills: g.kills,
+              drift: g.drift,
+              problems: g.problems,
+            }
+          : { name, title, finished: false, error },
+      ),
+      totals,
+    };
+    const json = (_: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
+    console.log(JSON.stringify(doc, json, 2));
+  } else {
+    console.log('\n' + table(outcomes, totals));
+  }
+
+  if (failures > 0) {
+    if (!args['no-write']) console.error(`${RESULTS_PATH} not written: the run failed`);
+    process.exitCode = 1;
+  } else if (!args['no-write'] && totals) {
+    const db = connect(config.databaseUrl);
+    let postgres = 'unknown';
+    try {
+      const [row] = await db<{ server_version: string }[]>`show server_version`;
+      postgres = row?.server_version ?? postgres;
+    } finally {
+      await db.end();
+    }
+    const script = relative(root, fileURLToPath(import.meta.url));
+    const info = {
+      commit,
+      date,
+      chain: `${env.chain} (${env.nodeVersion})`,
+      postgres,
+      node: process.version,
+      command: ['npx tsx', script, ...process.argv.slice(2)].join(' '),
+      seconds: seconds(started),
+    };
+    writeFileSync(join(root, RESULTS_PATH), resultsMarkdown(info, outcomes, totals));
+    say(`wrote ${RESULTS_PATH}`);
+  }
 }
-process.exitCode = failures > 0 ? 1 : 0;
+
+await runAll();
+if (interrupt.signal.aborted) {
+  console.error('interrupted');
+  process.exitCode = 130; // not process.exit: on macOS that can drop output still queued for a pipe
+} else {
+  await report();
+}

@@ -1,8 +1,10 @@
+import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { startMiner } from '../src/conformance/harness.js';
 import type { Db } from '../src/pipeline/db.js';
@@ -221,6 +223,48 @@ describe('fault run', () => {
       expect((await getWithdrawal(box.db, w.id)).state).toBe('RESERVED');
       expect(await box.db`select 1 from tx_attempts`).toHaveLength(0);
       expect(await eventsOf(box.db, w.id)).toEqual(['APPROVED>RESERVED']);
+    },
+  );
+});
+
+// The script end to end, on two scenarios: the whole quick matrix is a separate CI step.
+describe('fault-run script', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+
+  it(
+    'X4 the quick fault run exits 0 and reports zero sent twice, lost, unfinished and drift',
+    { timeout: 180_000 },
+    async () => {
+      const args = ['--quick', '--no-write', '--json', '--only', 'random_kills,duplicate_requests'];
+      const child = spawn('npx', ['tsx', 'scripts/fault-run.ts', ...args], {
+        cwd: root,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+      child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+      let code: number | null;
+      try {
+        [code] = (await once(child, 'exit')) as [number | null];
+      } finally {
+        // a timed-out test: the run stops its worker and drops its schema on SIGTERM
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      }
+      expect(code, stderr).toBe(0);
+
+      const out = JSON.parse(stdout) as {
+        passed: boolean;
+        scenarios: { name: string; kills: number; withdrawals: number; rejected: number }[];
+        totals: Record<string, number | string> | null;
+      };
+      expect(out.passed).toBe(true);
+      expect(out.scenarios.map((s) => s.name)).toEqual(['random_kills', 'duplicate_requests']);
+      expect(out.totals).toMatchObject({ sentTwice: 0, lost: 0, unfinished: 0, drift: '0' });
+      const [randomKills, duplicates] = out.scenarios;
+      expect(randomKills?.kills).toBeGreaterThan(0);
+      expect(randomKills?.withdrawals).toBe(10);
+      expect(duplicates?.rejected).toBe(2); // one not allowlisted, one over the limit
     },
   );
 });

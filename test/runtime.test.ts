@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { defaults } from '../src/config.js';
+import { config, defaults } from '../src/config.js';
 import { buildRuntime, readRuntimeEnv } from '../src/pipeline/runtime.js';
 import type { PipelineEnv } from '../scripts/lib/env.js';
 import { makeEvmEnv } from '../scripts/lib/evm-env.js';
@@ -66,7 +66,9 @@ describe('worker runtime from an environment', () => {
 
     // Only the sandbox's worker environment, nothing from process.env: the worker's adapter must
     // agree with the one the parent grades with.
-    it('builds the same hot wallet, tokens and finality depth as the sandbox', async () => {
+    it('builds the same hot wallet, node, tokens and finality depth as the sandbox', async () => {
+      // the parent's node, even where that is not the default one
+      expect(box.workerEnv().EVM_RPC_URL).toBe(config.evmRpcUrl);
       const deps = await buildRuntime(readRuntimeEnv(box.workerEnv()));
       try {
         const rt = deps.chains[env.chain];

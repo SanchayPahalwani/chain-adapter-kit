@@ -1,3 +1,4 @@
+import { createPublicClient, http } from 'viem';
 import { createEvmAdapter } from '../../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../../src/adapters/evm/devnet.js';
 import type { Devnet } from '../../src/conformance/harness.js';
@@ -34,15 +35,21 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     },
   };
 
+  const node = createPublicClient({ transport: http(config.evmRpcUrl) });
   return {
     chain: adapter.chain,
     adapter,
     devnet,
+    nodeVersion: await node.request({ method: 'web3_clientVersion' }),
     assets: ['native', token],
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
     freshAddress: async () =>
       adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
-    workerEnv: { KIT_EVM_TOKENS: token, KIT_EVM_FINALITY_DEPTH: String(adapter.finalityDepth) },
+    workerEnv: {
+      EVM_RPC_URL: config.evmRpcUrl,
+      KIT_EVM_TOKENS: token,
+      KIT_EVM_FINALITY_DEPTH: String(adapter.finalityDepth),
+    },
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
     async makeStuck() {
       stuck = true;

@@ -16,6 +16,8 @@ const workerId = process.env.KIT_WORKER_ID || String(process.pid);
 const deps = await buildRuntime(runtimeEnv);
 const crash = runtimeEnv.crashAt ? `, crash at ${runtimeEnv.crashAt}` : '';
 console.log(`worker ${workerId}: started${crash}`);
+// tells a supervisor this worker is past start-up; the callback keeps a closed channel quiet
+if (process.connected) process.send?.('started', undefined, undefined, () => undefined);
 try {
   await runWorker(deps, workerId, stop.signal);
 } finally {

@@ -6,6 +6,7 @@ export interface PipelineEnv {
   chain: string;
   adapter: ChainAdapter;
   devnet: Devnet;
+  nodeVersion: string; // what the node reports about itself, for docs/results.md
   assets: AssetId[]; // 'native' first
   unit(asset: AssetId): bigint;
   freshAddress(): Promise<string>; // a valid address nobody else uses

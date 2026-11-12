@@ -82,11 +82,12 @@ export interface SandboxOptions {
   // true: the hot wallet also holds a platform-owned float of every token, booked like the gas
   // float, so a duplicated token transfer lands at its destination instead of reverting
   tokenFloat?: boolean;
+  userId?: string; // the one user's id (default: a random one)
 }
 
 export async function openSandbox(
   env: PipelineEnv,
-  { fundOnChain = true, tokenFloat = false }: SandboxOptions = {},
+  { fundOnChain = true, tokenFloat = false, userId = `user-${randomUUID()}` }: SandboxOptions = {},
 ): Promise<Sandbox> {
   const t = await createTestDb();
   try {
@@ -97,7 +98,6 @@ export async function openSandbox(
       validateAddress: (chain, address) =>
         chain === env.chain && env.adapter.validateAddress(address),
     };
-    const userId = `user-${randomUUID()}`;
     const floats: [AssetId, bigint][] = [['native', gasFloat(env)]];
     if (tokenFloat) {
       for (const token of env.assets.slice(1)) floats.push([token, 100n * env.unit(token)]);

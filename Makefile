@@ -1,4 +1,4 @@
-.PHONY: up down test typecheck lint migrate conformance faults contracts
+.PHONY: up down test typecheck lint migrate conformance faults demo reconcile contracts
 
 node_modules: package-lock.json
 	npm ci
@@ -24,9 +24,19 @@ migrate: node_modules
 conformance: node_modules
 	npx vitest run test/*.conformance.test.ts
 
-# Kills worker processes at each crash point and checks every outcome on the chain.
+# The full fault matrix (scripts/lib/scenarios.ts), graded by the chain; writes docs/results.md
+# when every scenario passes.
 faults: node_modules
 	npx tsx scripts/fault-run.ts
+
+# A 30-second tour on a fresh schema: brings the containers up first.
+demo: node_modules up
+	npx tsx scripts/demo.ts
+
+# Reconciles the ledger against the chain, configured by the environment (KIT_SEED, KIT_DB_SCHEMA,
+# KIT_CHAINS, DATABASE_URL and the chain's own variables), which make passes through.
+reconcile: node_modules
+	npx tsx scripts/reconcile.ts
 
 # Compiles contracts/TestToken.sol with forge inside the Foundry image (solc version from the
 # file's pragma; forge downloads it on first use) and writes only its ABI and bytecode.

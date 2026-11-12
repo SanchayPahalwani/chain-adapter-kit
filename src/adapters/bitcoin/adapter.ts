@@ -2,7 +2,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { Address, OutScript, SigHash, Transaction, p2wpkh } from '@scure/btc-signer';
 import { hash160 } from '@scure/btc-signer/utils.js';
-import type { ChainAdapter, TransferIntent, TxStatus, UnsignedTx } from '../../core/adapter.js';
+import type { ChainAdapter, TransferIntent, TxStatus } from '../../core/adapter.js';
 import { RpcError, bitcoinRpc, btcToSats } from './rpc.js';
 
 export interface BitcoinAdapterOptions {
@@ -22,7 +22,8 @@ const DUST = 294n;
 
 // The opaque JSON values this adapter hands the pipeline. Every amount is a decimal string.
 type Fee = { feeRate: string }; // sat/vB
-type Reservation = { coins: { id: string; amount: string }[] }; // id is "<txid>:<vout>"
+type Coins = { id: string; amount: string }[]; // id is "<txid>:<vout>"
+type Reservation = { coins: Coins };
 // The unsigned transaction, and what its digests commit to besides it: each input's amount, and
 // its script, which is that of `from` (every input is a coin of the sender).
 type Body = { tx: string; from: string; amounts: string[] };
@@ -37,6 +38,8 @@ interface Block {
   previousblockhash?: string; // absent on the genesis block
   tx: { txid: string; vout: { n: number; value: number; scriptPubKey: { address?: string } }[] }[];
 }
+
+const max = (...values: bigint[]) => values.reduce((a, b) => (a > b ? a : b));
 
 function native(asset: string): void {
   if (asset !== 'native') throw new Error(`unknown asset ${asset}`);
@@ -78,7 +81,7 @@ function digests(tx: Transaction, from: string, amounts: bigint[]): Uint8Array[]
 // Spends every coin: `amount` to `intent.to`, the fee at `rate` sat/vB to the miner, and the rest
 // back to the sender, unless it is below dust, when it goes to the fee too. buildTransfer and
 // buildReplacement both build here, so a replacement differs from the original only in the change.
-function assemble(intent: TransferIntent, coins: Reservation['coins'], rate: bigint): UnsignedTx {
+function assemble(intent: TransferIntent, coins: Coins, rate: bigint, what = 'transfer') {
   native(intent.asset);
   if (!isP2wpkh(intent.to)) throw new Error(`not a regtest P2WPKH address: ${intent.to}`);
   const fee = feeFor(coins.length, 2, rate);
@@ -91,7 +94,8 @@ function assemble(intent: TransferIntent, coins: Reservation['coins'], rate: big
   const amounts = coins.map((c) => BigInt(c.amount));
   const total = amounts.reduce((sum, a) => sum + a, 0n);
   const change = total - intent.amount - fee;
-  if (change < 0n) throw new Error(`the coins hold ${total} sat, short of amount and fee`);
+  if (change < 0n)
+    throw new Error(`cannot afford ${what} at ${rate} sat/vB: the coins hold ${total} sat`);
   if (change >= DUST) tx.addOutputAddress(intent.from, change, REGTEST);
   const { from } = intent;
   const body: Body = { tx: bytesToHex(tx.unsignedTx), from, amounts: amounts.map(String) };
@@ -117,6 +121,10 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
   }
   const feeRate = opts.feeRate ?? 2n;
   if (feeRate <= 0n) throw new Error(`fee rate must be above 0 sat/vB, got ${feeRate}`);
+  // What quoteFee quotes, and the least a replacement pays. Fixed: estimatesmartfee answers
+  // "Insufficient data" on regtest, where blocks hold a few payments. A real network would use
+  // estimatesmartfee, raised to the mempoolminfee.
+  const marketRate = () => feeRate;
 
   // The node scans the UTXO set for one caller at a time and answers -8 to any other (this
   // adapter or another client), so wait up to 5 s for that scan to finish.
@@ -192,15 +200,13 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
       return { height, hash };
     },
 
-    // A fixed rate: estimatesmartfee answers "Insufficient data" on regtest, where blocks hold a
-    // few payments. A real network would use estimatesmartfee, raised to the mempoolminfee.
     // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
     async quoteFee(intent): Promise<Fee> {
       native(intent.asset);
       // checked here, before any coin is reserved: the node relays no output this small
       if (intent.amount < DUST)
         throw new Error(`${intent.amount} sat is below the ${DUST} sat dust limit`);
-      return { feeRate: feeRate.toString() };
+      return { feeRate: marketRate().toString() };
     },
 
     // Coins instead of a nonce. Only confirmed coins (the UTXO set holds no mempool outputs), so
@@ -276,25 +282,33 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
       return { txid: tx.id, raw: bytesToHex(tx.extract()) };
     },
 
-    // The same coins in the same order, so it conflicts with every earlier attempt and at most one
-    // confirms (BIP-125; Core 32 replaces any transaction). The same payment; the change pays the
-    // higher fee: at least an eighth and 1 sat/vB above the last rate, and what quoteFee asks now.
-    // That is more than the 0.1 sat/vB of its own size BIP-125 asks on top of the fee it replaces.
+    // Rebuilt from the previous attempt, as EVM's keeps its nonce: the same coins in the same order,
+    // so at most one attempt confirms (BIP-125; Core 32 replaces any transaction), and the same
+    // payment. A caller with other coins or another payment is refused. Only the change pays for
+    // a rate at least an eighth and 1 sat/vB above the last, and marketRate (BIP-125 asks 0.1).
     // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
     async buildReplacement(intent, reservation, previous) {
+      const body = previous.unsigned.body as Body;
+      const tx = Transaction.fromRaw(hexToBytes(body.tx));
+      const coins = body.amounts.map((amount, i) => {
+        const { txid, index } = tx.getInput(i);
+        return { id: `${bytesToHex(txid!)}:${index!}`, amount };
+      });
+      const to = tx.getOutputAddress(0, REGTEST)!;
+      const was = { from: body.from, to, asset: 'native', amount: tx.getOutput(0).amount! };
+      const key = (cs: Coins) => cs.map((c) => `${c.id}=${c.amount}`).join();
+      const differs = [
+        key((reservation as Reservation).coins) !== key(coins) && 'reservation',
+        ...(['from', 'to', 'asset', 'amount'] as const).filter((f) => intent[f] !== was[f]),
+      ].filter(Boolean);
+      if (differs.length > 0)
+        throw new Error(`the ${differs.join(', ')} differs from the previous attempt ${tx.id}`);
       const last = BigInt((previous.fee as Fee).feeRate);
-      const rate = [(last * 9n + 7n) / 8n, last + 1n, feeRate].reduce((a, b) => (a > b ? a : b));
-      const cannot = (why: string) =>
-        new Error(`cannot afford replacement at ${rate} sat/vB: ${why}`);
-      const { coins } = reservation as Reservation;
-      const held = coins.reduce((sum, c) => sum + BigInt(c.amount), 0n);
-      const fee = feeFor(coins.length, 2, rate);
-      if (held < intent.amount + fee)
-        throw cannot(`the coins hold ${held} sat, short of ${intent.amount} + ${fee}`);
-      const unsigned = assemble(intent, coins, rate);
+      const rate = max((last * 9n + 7n) / 8n, last + 1n, marketRate());
+      const unsigned = assemble(was, coins, rate, 'replacement');
       // both without change: the same transaction again, which pays no more
-      if ((unsigned.body as Body).tx === (previous.unsigned.body as Body).tx)
-        throw cannot('the previous attempt already pays all its change as fee');
+      if (unsigned.body.tx === body.tx)
+        throw new Error(`cannot afford replacement at ${rate} sat/vB: no change left to pay it`);
       return { unsigned, fee: { feeRate: rate.toString() } satisfies Fee };
     },
 

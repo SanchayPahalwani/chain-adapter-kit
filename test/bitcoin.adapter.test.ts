@@ -262,7 +262,9 @@ describe('Bitcoin adapter against regtest', () => {
     );
     // 293 sat of change went to the fee already. The bump fits in it, but the rest is folded
     // again: the same transaction, which pays no more.
-    await expect(replace(293n)).rejects.toThrow(/cannot afford replacement .* already pays/);
+    await expect(replace(293n)).rejects.toThrow(
+      /cannot afford replacement at 3 sat\/vB: no change left/,
+    );
     // 294 sat of change is kept at 2 sat/vB; at 3 sat/vB the 153 sat left is folded
     expect((await replace(294n))?.fee).toEqual({ feeRate: '3' });
   });
@@ -317,6 +319,7 @@ describe('Bitcoin adapter against regtest', () => {
     const a = await prepare(from, to, 100_000n);
     expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
     let previous = { unsigned: a.unsigned, fee: a.fee, signed: a.signed };
+    const attempts = [a.signed];
     let paid = await pooledFee(a.signed.txid);
     // a replacement of the replacement too: 2 sat/vB, then 3, then 4
     for (const feeRate of ['3', '4']) {
@@ -339,6 +342,7 @@ describe('Bitcoin adapter against regtest', () => {
       expect(await adapter.getTxStatus(previous.signed.txid)).toEqual({ state: 'unknown' });
       expect(await adapter.getTxStatus(signed.txid)).toEqual({ state: 'pending' });
       previous = { ...rep, signed };
+      attempts.push(signed);
       paid = now;
     }
     // the node keeps the replacement and refuses the original, which pays less
@@ -347,8 +351,10 @@ describe('Bitcoin adapter against regtest', () => {
       reason: expect.stringMatching(/insufficient fee/) as string,
     });
     await devnet.mine(1);
-    expect(await adapter.getTxStatus(previous.signed.txid)).toMatchObject({ state: 'confirmed' });
-    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'unknown' });
+    const states = await Promise.all(
+      attempts.map(async (t) => (await adapter.getTxStatus(t.txid)).state),
+    );
+    expect(states).toEqual(['unknown', 'unknown', 'confirmed']);
     expect(await adapter.getBalance(to, 'native')).toBe(100_000n);
   });
 
@@ -451,5 +457,76 @@ describe('Bitcoin adapter against regtest', () => {
       },
     ]);
     await expect(adapter.scanBlock(tip.height + 1)).rejects.toThrow(/Block height out of range/);
+  });
+
+  it('B13 buildReplacement refuses an intent or reservation that differs from the previous attempt', async () => {
+    const from = await wallet();
+    const other = (await wallet()).address;
+    // invented coins (no chain needed); the replacement is built from the previous attempt
+    const coins = [
+      { id: `${'ef'.repeat(32)}:1`, amount: '60000' },
+      { id: `${'ab'.repeat(32)}:0`, amount: '50000' },
+    ];
+    const intent = {
+      from: from.address,
+      to: (await wallet()).address,
+      asset: 'native',
+      amount: 100_000n,
+    };
+    const fee: Json = { feeRate: '2' };
+    const previous = { unsigned: await adapter.buildTransfer(intent, { coins }, fee), fee };
+    const replace = (i: typeof intent, c: typeof coins) =>
+      adapter.buildReplacement(i, { coins: c }, previous);
+    await expect(replace(intent, coins)).resolves.toMatchObject({ fee: { feeRate: '3' } });
+
+    const intents = [
+      { ...intent, to: other },
+      { ...intent, from: other },
+      { ...intent, asset: 'token' },
+      { ...intent, amount: 99_999n },
+    ];
+    for (const i of intents) {
+      const field = Object.keys(i).find(
+        (k) => i[k as keyof typeof i] !== intent[k as keyof typeof i],
+      );
+      await expect(replace(i, coins)).rejects.toThrow(
+        `the ${field} differs from the previous attempt`,
+      );
+    }
+    const reservations = [
+      [...coins].reverse(), // the same coins in another order
+      coins.slice(0, 1),
+      [...coins, { id: `${'cd'.repeat(32)}:2`, amount: '1000' }],
+      [coins[0]!, { ...coins[1]!, amount: '50001' }],
+      [coins[0]!, { ...coins[1]!, id: `${'ab'.repeat(32)}:1` }],
+    ];
+    for (const c of reservations)
+      await expect(replace(intent, c)).rejects.toThrow('the reservation differs from the previous');
+  });
+
+  it('B14 a replacement that folds its change into the fee is accepted and confirms alone', async () => {
+    // 1 input: 294 sat of change at 2 sat/vB is kept (the smallest relayed); the first bump to
+    // 3 sat/vB leaves 153 sat, which go to the fee: 282 + 294 = 576 sat in all
+    const from = await walletWith(100_000n);
+    const to = (await wallet()).address;
+    const a = await prepare(from, to, 100_000n - 282n - 294n);
+    expect(await outputs(a.signed.raw)).toEqual([to, from.address]);
+    expect(await adapter.broadcast(a.signed)).toEqual({ outcome: 'accepted' });
+    const rep = await adapter.buildReplacement(a.intent, a.reservation, a);
+    if (!rep) throw new Error('a Bitcoin replacement is never null');
+    const signed = adapter.attachSignatures(rep.unsigned, await sign(from.keyId, rep.unsigned));
+    expect(await outputs(signed.raw)).toEqual([to]);
+    expect(await adapter.broadcast(signed)).toEqual({ outcome: 'accepted' });
+    expect((await pooledFee(signed.txid)).fee).toBe(576n);
+    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'unknown' });
+
+    await devnet.mine(1);
+    expect(await adapter.getTxStatus(signed.txid)).toMatchObject({
+      state: 'confirmed',
+      feePaid: 576n,
+    });
+    expect(await adapter.getTxStatus(a.signed.txid)).toEqual({ state: 'unknown' });
+    expect(await adapter.getBalance(to, 'native')).toBe(a.intent.amount);
+    expect(await adapter.getBalance(from.address, 'native')).toBe(0n);
   });
 });

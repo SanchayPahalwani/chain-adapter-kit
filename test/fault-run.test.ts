@@ -11,9 +11,9 @@ import type { Db } from '../src/pipeline/db.js';
 import { getWithdrawal } from '../src/pipeline/requests.js';
 import { verifyAgainstChain } from '../src/pipeline/verify.js';
 import { grade } from '../scripts/lib/grading.js';
-import type { PipelineEnv } from '../scripts/lib/env.js';
+import { nodeOverride, type PipelineEnv } from '../scripts/lib/env.js';
 import { makeEvmEnv } from '../scripts/lib/evm-env.js';
-import { table, totalsOf, type Outcome } from '../scripts/lib/results.js';
+import { resultsMarkdown, table, totalsOf, type Outcome } from '../scripts/lib/results.js';
 import { parseRunArgs, UsageError } from '../scripts/lib/run-args.js';
 import { openSandbox, type Sandbox } from '../scripts/lib/sandbox.js';
 import {
@@ -322,6 +322,48 @@ describe('fault-run script', () => {
       }
     },
   );
+
+  it('X6c the header records a node the environment chose, without its credentials', () => {
+    expect(nodeOverride('EVM_RPC_URL', 'http://127.0.0.1:58545', 'http://127.0.0.1:58545')).toBe(
+      undefined,
+    );
+    expect(nodeOverride('BITCOIN_RPC_URL', 'http://kit:secret@127.0.0.1:58554/', 'x')).toBe(
+      'BITCOIN_RPC_URL=http://127.0.0.1:58554',
+    );
+    const verdict = {
+      withdrawals: 0,
+      settled: 0,
+      rejected: 0,
+      failed: 0,
+      sentTwice: 0,
+      lost: 0,
+      unfinished: 0,
+    };
+    const totals = totalsOf([{ kills: 0, killsMidHandler: 0, verdict, drift: 0n, problems: [] }]);
+    const info = {
+      commit: '`abc1234`',
+      date: '2026-11-12T00:00:00Z',
+      chains: 'evm-anvil (anvil/v1.9.0)',
+      overrides: [] as string[],
+      postgres: '17',
+      node: 'v22',
+      command: 'npx tsx scripts/fault-run.ts',
+      seconds: 1,
+    };
+    const header = (overrides: string[]) =>
+      resultsMarkdown({ ...info, overrides }, [], totals)
+        .split('\n')
+        .slice(6, 9);
+    expect(header([])).toEqual([
+      '- Chains: evm-anvil (anvil/v1.9.0)',
+      '- Postgres 17, Node v22',
+      '- Command: `npx tsx scripts/fault-run.ts`',
+    ]);
+    expect(header(['EVM_RPC_URL=http://127.0.0.1:58553']).slice(0, 2)).toEqual([
+      '- Chains: evm-anvil (anvil/v1.9.0)',
+      '- Nodes set by the environment, not the defaults: EVM_RPC_URL=http://127.0.0.1:58553',
+    ]);
+  });
 
   it('X6b the total row covers every chain in the table', () => {
     const verdict = {

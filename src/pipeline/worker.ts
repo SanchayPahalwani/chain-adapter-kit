@@ -37,7 +37,8 @@ export async function hotWallet(adapter: ChainAdapter, signer: Signer): Promise<
  * worker is claiming, or whose handler holds its row lock mid-transition, is passed over.
  * The lease only avoids duplicate work; the handlers stay correct without it. Only chains this
  * worker has a runtime for: another chain's row would fail here and back off, delaying the
- * worker that can run it.
+ * worker that can run it. A withdrawal for a chain no running worker serves waits in its state,
+ * untouched and without an error, until a worker with that chain's runtime runs.
  */
 export async function claim(deps: WorkerDeps, workerId: string): Promise<Withdrawal | null> {
   const chains = Object.keys(deps.chains);

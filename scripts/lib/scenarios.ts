@@ -569,7 +569,7 @@ const stuckFeeScenario: Scenario = {
     'block on (how, on each chain, is in its note) and one block is mined. A node that evicts ' +
     'what pays less (anvil) then holds none of the first attempts, and each withdrawal must ' +
     'find its first attempt gone and have the re-send of it refused; a node that keeps it ' +
-    'waiting (bitcoind) still holds all of them, and no attempt may be sent again. Then ' +
+    'waiting (bitcoind) still holds all of them, and no attempt is re-sent and accepted. Then ' +
     'workers and blocks resume. Each withdrawal must replace its first attempt (an attempt is ' +
     `stale after ${STALE_MS / 1000} s); no first attempt may confirm, and each withdrawal must ` +
     'settle on a replacement.',

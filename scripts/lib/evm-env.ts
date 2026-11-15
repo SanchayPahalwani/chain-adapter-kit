@@ -54,8 +54,8 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     fundingPieces: 1, // a nonce, not coins: one balance pays any number of withdrawals
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
     stuckNote:
-      `the harness sets anvil's base fee to ${STUCK_BASE_FEE / 10n ** 9n} gwei before every ` +
-      `block (normally ${NORMAL_BASE_FEE / 10n ** 9n} gwei)`,
+      `the harness raises anvil's base fee to ${STUCK_BASE_FEE / 10n ** 9n} gwei before every ` +
+      `block, and sets it back to ${NORMAL_BASE_FEE / 10n ** 9n} gwei afterwards`,
     reorgKeepsMempool: false, // anvil_reorg drops the removed blocks' transactions
     async makeStuck() {
       stuck = true;

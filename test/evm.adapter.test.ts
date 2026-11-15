@@ -254,7 +254,7 @@ describe('EVM adapter against a stub node', () => {
       maxFeePerGas: '2000000000',
       maxPriorityFeePerGas: '1000000000',
     };
-    const unsigned = await adapter.buildTransfer(intent, { nonce: '0' }, fee);
+    const unsigned = await adapter.buildTransfer(intent, { nonce: '0', from }, fee);
     const sign = (key: string) =>
       signer.sign(key, 'secp256k1', hexToBytes(unsigned.signingPayloads[0]!));
     return { from, unsigned, sign };
@@ -447,8 +447,26 @@ describe('EVM adapter broadcast against anvil', () => {
     ).rejects.toThrow(`the sender ${other} differs from the previous attempt's ${from.address}`);
     const next = String(BigInt(nonce) + 1n);
     await expect(
-      adapter.buildReplacement(previous.intent, { nonce: next }, previous),
+      adapter.buildReplacement(
+        previous.intent,
+        { ...(previous.reservation as object), nonce: next },
+        previous,
+      ),
     ).rejects.toThrow(`the reservation (nonce ${next}) differs from the previous attempt's nonce`);
+  });
+
+  it('buildTransfer refuses a reservation made for another address', async () => {
+    const from = await wallet();
+    const other = (await wallet()).address;
+    const previous = await unsignedTransfer(from, new MemoryInputStore());
+    const { nonce } = previous.reservation as { nonce: string };
+    const fee = { gasLimit: '21000', maxFeePerGas: '2000000000', maxPriorityFeePerGas: '1' };
+    await expect(
+      adapter.buildTransfer(previous.intent, { nonce, from: other }, fee),
+    ).rejects.toThrow(`differs from the address ${other} the nonce was reserved for`);
+    await expect(
+      adapter.buildReplacement(previous.intent, { nonce, from: other }, previous),
+    ).rejects.toThrow(`the reservation's address ${other} differs`);
   });
 
   it('buildReplacement follows the market when it is above the bumped fee', async () => {

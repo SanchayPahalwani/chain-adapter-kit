@@ -42,7 +42,8 @@ const chain = 'evm-anvil';
 
 // The opaque JSON values this adapter hands the pipeline. Every number is a decimal string.
 type Fee = { gasLimit: string; maxFeePerGas: string; maxPriorityFeePerGas: string };
-type Reservation = { nonce: string };
+// `from` (checksummed): the nonce sequence is keyed by the sender, so a nonce is only good for it.
+type Reservation = { nonce: string; from: string };
 type Body = {
   chainId: string;
   // Checksummed. Not serialised (the signature names the sender), but a nonce is a nonce of one
@@ -221,12 +222,17 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
 
     async reserveInputs(store: InputStore, intent: TransferIntent): Promise<Reservation> {
       const nonce = await store.nextSequence(`${chain}:${intent.from}`);
-      return { nonce: nonce.toString() };
+      return { nonce: nonce.toString(), from: getAddress(intent.from) };
     },
 
     // eslint-disable-next-line @typescript-eslint/require-await -- async so a bad intent rejects
     async buildTransfer(intent: TransferIntent, reservation: Json, fee: Json): Promise<UnsignedTx> {
-      const { nonce } = reservation as Reservation;
+      const { nonce, from } = reservation as Reservation;
+      if (getAddress(intent.from) !== from) {
+        throw new Error(
+          `the sender ${intent.from} differs from the address ${from} the nonce was reserved for`,
+        );
+      }
       const { gasLimit, maxFeePerGas, maxPriorityFeePerGas } = fee as Fee;
       const { to, value, data } = call(intent);
       const body: Body = {
@@ -284,7 +290,12 @@ export async function createEvmAdapter(opts: EvmAdapterOptions): Promise<ChainAd
           `the sender ${intent.from} differs from the previous attempt's ${body.from}`,
         );
       }
-      const { nonce } = reservation as Reservation;
+      const { nonce, from } = reservation as Reservation;
+      if (from !== body.from) {
+        throw new Error(
+          `the reservation's address ${from} differs from the previous attempt's ${body.from}`,
+        );
+      }
       if (nonce !== body.nonce) {
         throw new Error(
           `the reservation (nonce ${nonce}) differs from the previous attempt's nonce ${body.nonce}`,

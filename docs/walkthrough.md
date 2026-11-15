@@ -22,8 +22,9 @@ each of the nine crash points in `src/pipeline/crash.ts`, and inside open transa
 All in `migrations/001_init.sql`.
 
 - `withdrawals`: one row for this withdrawal. The request, `state`, `reject_reason`;
-  from `RESERVED` on, the `fee` quote and the `reservation` (`{"nonce": "..."}`) as
-  `jsonb`; `settled_txid` at the end; and the worker's bookkeeping: `lease_owner`,
+  from `RESERVED` on, the `fee` quote and the `reservation` as `jsonb` (on EVM the nonce
+  and the address it was reserved for, `{"nonce": "...", "from": "0x..."}`);
+  `settled_txid` at the end; and the worker's bookkeeping: `lease_owner`,
   `lease_expires_at`, `next_run_at`, `error_count`, `last_error`.
 - `tx_attempts`: one row per signed transaction, keyed `(withdrawal_id, attempt_no)`,
   with a unique `txid`. It holds `raw`, the `unsigned` body and signing payloads, the
@@ -45,11 +46,12 @@ the EVM adapter does not use it.
 
 `src/pipeline/requests.ts`, `submitWithdrawal`; tests in `test/requests.test.ts`.
 
-Before a transaction opens, an amount of zero or less throws `RangeError`, the policy is
-read with `deps.policy(chain, asset)` (an unknown asset throws there), and
-`assertValidPolicy` checks that M is an integer between 1 and the number of approvers. A
-configuration error writes nothing; it never becomes a rejection row (R20, R21). Then one
-transaction:
+Before a transaction opens, an amount of zero or less throws `RangeError`, and so does a
+user id containing `:`, which ledger account names use as a separator (R23). The policy
+is read with `deps.policy(chain, asset)` (an unknown asset throws there), and
+`assertValidPolicy` checks that M is an integer between 1 and the number of approvers and
+that no approver is listed twice. A configuration error writes nothing; it never becomes
+a rejection row (R20, R21). Then one transaction:
 
 1. **Idempotency.** The row is inserted with state `'APPROVED'` and
    `on conflict (user_id, idempotency_key) do nothing returning *`. No row back means the
@@ -66,8 +68,9 @@ transaction:
 3. **Policy, in order** (`checkRequest` in `src/pipeline/policy.ts`, first failure
    wins): `invalid_address`, `not_allowlisted`, `over_withdrawal_limit`,
    `over_24h_limit`. The 24-hour total (`recentTotal`) sums the user's other
-   non-`REJECTED` withdrawals of the same chain and asset created in the last 24 hours
-   by `now()`: the database clock, not the process clock (R5, R6).
+   withdrawals of the same chain and asset created in the last 24 hours by `now()`, the
+   database clock, not the process clock, leaving out `REJECTED` and `FAILED` ones,
+   whose holds were never placed or were released (R5, R6, R6b).
 4. **The hold, in a savepoint.** `placeHold` posts `hold:<id>`: debit the user, credit
    `withdrawals_in_flight`. A short balance fails the check constraint, which `post`
    turns into `InsufficientFunds`. A failed statement aborts a Postgres transaction, so
@@ -87,20 +90,21 @@ has left `AWAITING_APPROVAL` is returned unchanged (R14). The requester and anyo
 the approver set get `NotAnApprover` (R13). One `approvals` row per approver; the
 `on conflict ... do update` clause only ever turns an `approve` into a `reject`. A reject
 posts `release:<id>` and moves to `REJECTED`; an approve recounts and moves to `APPROVED`
-at M distinct approvers (R11, R17). A reject vetoes even from an approver who approved
-earlier (R16, design call 21): a veto must never be dropped silently, and every held
-withdrawal needs a way out inside the system. The row lock orders an approve that races a
-reject, so the withdrawal ends in one consistent state (R21b).
+at M distinct approvers, counting only those the policy lists now, so one removed after
+approving no longer counts (R11, R17, R17b). A reject vetoes even from an approver who
+approved earlier (R16, design call 21): a veto must never be dropped silently, and every
+held withdrawal needs a way out inside the system. The row lock orders an approve that
+races a reject, so the withdrawal ends in one consistent state (R21b).
 
 ## Stop 2: the claim and the lease
 
 `src/pipeline/worker.ts`, `claim` and `runOnce`.
 
 `claim` is one `update ... where id = (select ... for update skip locked)`. It picks a
-row in `APPROVED`, `RESERVED`, `SIGNED` or `BROADCAST` whose `next_run_at` has passed and
-whose lease is empty or expired, and sets `lease_owner` and
-`lease_expires_at = now() + leaseMs`. Choosing and leasing are one statement, on the
-database's clock. `skip locked` passes over a row another worker is claiming, or whose
+row in `APPROVED`, `RESERVED`, `SIGNED` or `BROADCAST`, of a chain this worker has a
+runtime for, whose `next_run_at` has passed and whose lease is empty or expired, and sets
+`lease_owner` and `lease_expires_at = now() + leaseMs`. Choosing and leasing are one
+statement, on the database's clock. `skip locked` passes over a row another worker is claiming, or whose
 handler holds its row lock mid-transition.
 
 `runOnce` runs `handlers[w.state]` with the row as read at claim time, then releases with
@@ -108,7 +112,8 @@ an update matched on `lease_owner = workerId`, so a worker whose lease was taken
 leaves the new owner's lease alone:
 
 - success: lease cleared, `error_count = 0`, `next_run_at` untouched, so the next step is
-  due at once; only `track` delays itself, through `poll`.
+  due at once; only `track` delays itself, through `poll`. If the step changed the state,
+  an old `last_error` is cleared too.
 - `LostRace`: lease cleared, nothing recorded. Another worker made this step.
 - any other error: `error_count + 1`, `last_error`, and `next_run_at` moved out by
   `retryBaseMs * 2^min(error_count, 6)`. The state is unchanged (P6).
@@ -160,10 +165,11 @@ Why this order:
 ## Stop 4: sign (RESERVED to SIGNED)
 
 `sign`. It calls `buildTransfer` with `w.reservation` and `w.fee` from the row; the EVM
-adapter returns an EIP-1559 body and one signing payload, the keccak of the serialised
-unsigned transaction. `signTx` calls `signer.sign(hotKeyId, curve, payload)` per payload,
-and `attachSignatures` builds `raw` and computes `txid = keccak256(raw)` locally. Nothing
-has gone to the chain. Then:
+adapter returns an EIP-1559 body, which records the sender as `from`, and one signing
+payload, the keccak of the serialised unsigned transaction. `signTx` calls
+`signer.sign(hotKeyId, curve, payload)` per payload, and `attachSignatures` builds `raw`
+(sending a high-S signature in its low-S form) and computes `txid = keccak256(raw)`
+locally. Nothing has gone to the chain. Then:
 
 ```ts
 await deps.db.begin(async (tx) => {
@@ -188,6 +194,13 @@ Why this order:
   untargeted on purpose: it would mean two attempts share their bytes, so it fails loudly
   and backs off (test "an attempt whose txid another withdrawal already stored is an
   error, not a lost race").
+- **The sender is part of the attempt.** A nonce belongs to one address. The reservation
+  names the address it was taken for, `buildTransfer` refuses an intent from any other,
+  and `attachSignatures` recovers the signer from the signature and refuses anyone but
+  `from`. A worker with another seed or a rotated key fails here, with `last_error`,
+  instead of spending this nonce from another address ("buildTransfer refuses a
+  reservation made for another address" in `test/evm.adapter.test.ts`; F7 in Stop 7).
+  Bitcoin gets the same by checking that the recovered key owns the inputs.
 
 **Crash points in this stop.**
 
@@ -258,13 +271,15 @@ Then:
 1. More than one attempt confirmed: throw and settle nothing. The adapter promised that
    cannot happen; if it does, it shows as `last_error` on every retry, not in the ledger.
 2. An attempt with `seen_block` set that is not confirmed now was reorganised out:
-   `setSeenBlock(..., null)`.
-3. One confirmed: record its block hash if it changed. At `finalityDepth`
-   confirmations, `settle`; below it, `poll`.
+   `setSeenBlock(..., null)` and a `reorged_out` event.
+3. One confirmed: record its block hash if it changed (a `reorg` event when it moved
+   from one block to another). At `finalityDepth` confirmations, `settle`; below it,
+   `poll`.
 4. None confirmed: if the latest is `unknown`, broadcast the same stored bytes again (a
    `rebroadcast` event only if accepted; a rejection goes to `last_error` through
-   `poll`). If the latest is stale and there are fewer than `maxAttempts` attempts,
-   `replace`. Otherwise `poll` sets `next_run_at` one `pollMs` out.
+   `poll`, or into the `replacement` event if one follows). If the latest is stale and
+   there are fewer than `maxAttempts` attempts, `replace`. Otherwise `poll` sets
+   `next_run_at` one `pollMs` out.
 
 `settle` runs one transaction. `transition` from `BROADCAST` to `SETTLED` (or `FAILED`)
 with `settled_txid` comes first, then the postings through `postOnce`, which throws if a
@@ -299,9 +314,11 @@ Why this order:
   fields; nothing reads them. P1 checks this end state against the chain.
 
 **Replacement.** `replace` calls `buildReplacement` with the stored reservation and the
-previous attempt's unsigned body and fee. On EVM that is the same body, so the same nonce,
-with both fee fields raised by at least one eighth and at least to the current market
-quote (`bumped`, design call 24). It signs, then in one transaction: `transition` from
+previous attempt's unsigned body and fee. On EVM that is the same body, so the same nonce
+and the same `from`, with both fee fields raised by at least one eighth and at least to
+the current market quote (`bumped`, design call 24). It refuses a sender (in the intent
+or the reservation) or a nonce other than the previous body's, so a replacement always
+conflicts with what it replaces. It signs, then in one transaction: `transition` from
 `BROADCAST` back to `SIGNED` first, `storeAttempt` with the next `attempt_no`, and a
 `replacement` event. The `broadcast` handler then sends it exactly as it sends a first
 attempt (design call 4: one send path, one recovery path).
@@ -316,26 +333,35 @@ attempt (design call 4: one send path, one recovery path).
 
 ## Stop 7: when the chain misbehaves
 
-These tests in `test/pipeline-suite.ts` run in-process against anvil, with
-`finalityDepth: 2` from `scripts/lib/evm-env.ts`.
+These tests in `test/pipeline-suite.ts` run in-process on both chains: against anvil from
+`test/evm.pipeline.test.ts` and against bitcoind from `test/bitcoin.pipeline.test.ts`,
+each with `finalityDepth: 2` from its env (`scripts/lib/evm-env.ts`,
+`scripts/lib/bitcoin-env.ts`). This stop follows anvil and says where bitcoind differs.
 
 **Dropped (F1).** The test removes the broadcast transaction from the mempool. `track`
 sees `unknown` and sends the same stored bytes; the withdrawal settles with its single
-attempt, and the event list shows one `rebroadcast`.
+attempt, and the event list shows one `rebroadcast`. Bitcoin Core cannot remove one
+transaction, so its devnet expires the whole mempool by moving the node's clock and puts
+the others back (`dropFromMempool` in `src/adapters/bitcoin/devnet.ts`).
 
 **Reorganised out before finality (F2).** One block gives one confirmation; `track`
-records `seen_block`. `reorg(1)` (anvil's `anvil_reorg`) replaces that block, the attempt
-is no longer confirmed, and `track` clears `seen_block`. The transaction is mined again in
-a block with another hash and settles with the same txid: one attempt, one `reorg` or
-`reorged_out` event.
+records `seen_block`. `reorg(1)` (anvil's `anvil_reorg`) replaces that block with an
+empty one. Anvil forgets the removed block's transaction, so `track` sees `unknown`,
+clears `seen_block` (`reorged_out`) and sends the same stored bytes again; they are mined
+in a block with another hash and the withdrawal settles with the same txid. Bitcoin Core
+puts the transaction back in its mempool instead: nothing is sent again, and depending on
+whether `track` runs before the next block it records `reorged_out` or a `reorg` from the
+old block to the new one. On both: one attempt, and one of those two events.
 
 **Stuck or evicted (F3, F6).** `makeStuck` raises the base fee to 100 gwei before every
 block. anvil evicts a pending transaction priced below a mined block's base fee, so the
 attempt becomes `unknown` and its re-send is rejected. Once it is stale, `replace` builds
 attempt 2 from the same reservation (the test checks the reservation did not change) at a
-higher fee and moves back to `SIGNED`. Attempt 2 settles; attempt 1 never confirms. F6:
-with `maxAttempts` 3 the pipeline stops at three attempts, keeps polling, and still
-settles exactly one.
+higher fee and moves back to `SIGNED`. Attempt 2 settles; attempt 1 never confirms. On
+bitcoind the env's `mine` takes only transactions paying at least 1 sat/vB over the
+adapter's rate (`mineAtLeast`), and the node keeps attempt 1 pending: no re-send, and the
+`replacement` event records no refusal. F6: with `maxAttempts` 3 the pipeline stops at
+three attempts, keeps polling, and still settles exactly one.
 
 **Reverted (F4).** The test makes `getTxStatus` report every confirmation as reverted.
 `settle` takes the `FAILED` branch: the fee is posted, since the gas was spent, and
@@ -343,10 +369,19 @@ settles exactly one.
 real revert is in `test/evm.pipeline.test.ts`: the tokens are burnt after `RESERVED`, so
 the stored token transfer reverts when mined.
 
-**Underfunded hot wallet (F5).** The node rejects the send. The rejection is recorded and
-the state moves to `BROADCAST`; `track` re-sends every poll and keeps the rejection in
-`last_error`, with no event per poll. Once the wallet is funded the withdrawal settles:
-delayed, never failed.
+**Underfunded hot wallet (F5).** On EVM the node rejects the send. The rejection is
+recorded and the state moves to `BROADCAST`; `track` re-sends every poll and keeps the
+rejection in `last_error`, with no event per poll. On Bitcoin no coin can be reserved,
+so `reserve` fails and the withdrawal waits in `APPROVED`, backing off. Once the wallet is
+funded the withdrawal settles: delayed, never failed.
+
+**Another signing key (F7).** After the first broadcast, two workers try to replace the
+attempt: one started with another seed, so another hot address, and one with another key
+behind the same address. `buildReplacement` refuses the first (its sender differs from
+the previous attempt's) and `attachSignatures` the second (the signature is not the
+sender's). Each run fails with `last_error` and the state stays `BROADCAST`; no second
+attempt is stored and the node holds only the first. A worker with the right key then
+settles that first attempt alone.
 
 ## Stop 8: two workers on one withdrawal
 
@@ -380,17 +415,18 @@ A count of zero throws `LostRace` and rolls the transition back. Without the che
   value read at the start of `track`, so one worker writes the event.
 
 No step trusts the lease. Safety comes from the compare-and-swap on state, from sending
-only stored bytes, and from attempts that exclude each other on the chain (design call
-5). On the worker path, clocks appear only in `claim`, `poll`, the backoff and the
-`stale` flag: they decide when work happens, never whether it is safe. One documented
-exception is test-only: `killOnce` assumes one worker per withdrawal, which the fault run
-respects.
+only stored bytes, and from attempts that exclude each other on the chain because they
+spend the same nonce or coins of the same sender (design call 5; Stop 4). On the worker
+path, clocks appear only in `claim`, `poll`, the backoff and the `stale` flag: they decide
+when work happens, never whether it is safe. One documented exception is test-only:
+`killOnce` assumes one worker per withdrawal, which the fault run respects.
 
 ## Stop 9: the ledger after settlement
 
-Before the withdrawal, the sandbox (`scripts/lib/sandbox.ts`) posts `fund:<hot address>`
-(debit `custody`, credit `platform`, the gas float) and a deposit (debit `custody`, credit
-the user). Then, for amount A and on-chain fee F, all in `evm-anvil:native`:
+Before the withdrawal, the sandbox (`scripts/lib/sandbox.ts`) posts
+`fund:<hot address>:native` (debit `custody`, credit `platform`, the gas float) and a
+deposit (debit `custody`, credit the user). Then, for amount A and on-chain fee F, all in
+`evm-anvil:native`:
 
 | Posting (`ref`) | Where              | Debit                   | Credit                  | Amount |
 | --------------- | ------------------ | ----------------------- | ----------------------- | ------ |
@@ -415,34 +451,53 @@ transfer is explained (Q2).
 
 ## How the claim is tested
 
-`scripts/fault-run.ts` runs one scenario per crash point, each in a fresh schema with a
-freshly funded hot wallet (`openSandbox`). Per scenario:
+`scripts/fault-run.ts` runs every scenario of spec section 11 on each chain in turn,
+`evm-anvil` and then `bitcoin-regtest`, each in a fresh schema with a freshly funded hot
+wallet (`openSandbox`) and worker processes (`scripts/worker-main.ts`) under a supervisor
+(`scripts/lib/supervisor.ts`). The scenarios are in `scripts/lib/scenarios.ts`:
 
-1. It submits n withdrawals (10 by default), alternating native and the test token, each
-   to its own fresh allowlisted address and for its own amount, so a transfer to the
-   wrong place shows as one sent twice and one lost.
-2. `superviseUntilDone` (`scripts/lib/supervisor.ts`) runs one worker process at a time
-   (`scripts/worker-main.ts`) with `KIT_CRASH_AT` set and a one-second lease. `killOnce`
-   records a `crash_injected` event in its own autocommit statement, then sends its own
-   process SIGKILL; the server rolls back whatever was open. The supervisor counts the
-   kill and starts a fresh worker, which passes that point for that withdrawal because
-   the event exists. This repeats until every withdrawal is terminal, with a miner
-   producing blocks (held back in the replacement scenario).
-3. `verifyAgainstChain` grades by what each destination holds on the chain, not by the
-   pipeline's records: more than the amount is sent twice, a `SETTLED` withdrawal whose
-   destination holds less is lost, a non-terminal one is unfinished. Then `reconcile`.
-4. The scenario fails on any of those, on a withdrawal that did not settle, on drift or a
-   failed check, or on kills that do not match the `crash_injected` events. Any failed
-   scenario makes the exit code 1.
+- **Kill at each crash point** (nine scenarios). One worker at a time runs with
+  `KIT_CRASH_AT` set and a one-second lease. `killOnce` records a `crash_injected` event
+  in its own autocommit statement, then sends its own process SIGKILL; the server rolls
+  back whatever was open. The supervisor starts a fresh worker, which passes that point
+  for that withdrawal because the event exists, until every withdrawal is terminal. The
+  kills must match the events, and at `after_broadcast` the restarted worker must have
+  found every first attempt on the node and recorded it with `sent: false`.
+- **Random kills.** Several workers, no crash point; the supervisor SIGKILLs a random one
+  at random intervals, and withdrawals are submitted in batches until a minimum number
+  of kills caught a worker holding a withdrawal (its lease still in the dead worker's
+  name).
+- **Duplicate requests.** Each request is submitted several times at once with one key,
+  over separate connections, and again afterwards; two more are refused by policy and
+  must stay refused.
+- **Dropped, reorg, stuck fee.** No blocks until every withdrawal is broadcast; the fault
+  is made with the workers stopped; then workers and blocks resume. Each checks that its
+  fault happened and was handled the way its node requires: every dropped attempt sent
+  again; every withdrawal recording `reorged_out`, with a re-send only where the node
+  forgot the transaction; every first attempt replaced, and none confirmed, after the
+  stuck fee.
+
+Each withdrawal goes to its own fresh allowlisted address for its own amount, alternating
+native and the test token on EVM, so a transfer to the wrong place shows as one sent twice
+and one lost; a token float in the hot wallet lets a duplicated token transfer land
+rather than revert. `grade` (`scripts/lib/grading.ts`) mines `finalityDepth + 1` blocks
+and requires that the node holds nothing more from the hot wallet (`Devnet.pendingFrom`,
+C16). `verifyAgainstChain` then grades by what each destination holds on the chain: more
+than the amount, or anything at a `REJECTED` or `FAILED` destination, is sent twice; a
+`SETTLED` withdrawal whose destination holds less is lost; a non-terminal one is
+unfinished. Then `reconcile`. A scenario fails on any of those, on an outcome other than
+the expected settled and rejected counts, on drift or a failed check, or on its own
+check; any failure makes the exit code 1.
 
 ```sh
-make up       # Postgres and anvil
-make faults   # npx tsx scripts/fault-run.ts
-npx tsx scripts/fault-run.ts --quick --only after_broadcast
+make up       # Postgres, anvil and bitcoind, building the bitcoind image
+make faults   # npx tsx scripts/fault-run.ts: every scenario on both chains
+npx tsx scripts/fault-run.ts --chain bitcoin-regtest --quick --only after_broadcast
 ```
 
-The results table is in `docs/results.md`, generated from a run; this document quotes no
-numbers.
+The results table is in `docs/results.md`, written only by the full matrix at default
+counts on both chains when every scenario passed and the checkout did not change during
+the run; this document quotes no numbers.
 
 ## Questions a reviewer is likely to ask
 
@@ -463,17 +518,28 @@ the transaction that commits `RESERVED`, and a rollback returns it (I3, I4). The
 and since the node is read only for the first seed (I5), a transaction sent from the hot
 address outside the pipeline would leave the counter behind.
 
-**What would change for Bitcoin?** The adapter only. `syncInputs` would call `putCoins`;
-`reserveInputs` would pick from `freeCoins` (row-locked, `skip locked`) and call
-`reserveCoins`, which is all or nothing (I6, I7, I7b); one signing payload per input; a
-replacement spends the same inputs. `pgInputStore` and `chain_coins` exist and the
-handlers have no per-chain branch. The Bitcoin adapter itself is not in the repo yet.
+**What changes for Bitcoin?** In the pipeline, nothing: the same handlers run it
+(`test/bitcoin.pipeline.test.ts` runs the pipeline suite on bitcoind, where only P2, a
+token withdrawal, skips, plus "P4 on Bitcoin", which checks that each transaction spent
+exactly its own reserved coins). The
+adapter (`src/adapters/bitcoin/adapter.ts`) differs where the chain does. `syncInputs`
+calls `putCoins` with the hot address's confirmed coins; `reserveInputs` picks from
+`freeCoins` (row-locked, `skip locked`), largest first, and calls `reserveCoins`, which is
+all or nothing (I6, I7, I7b); there is one signing payload per input (B9); the public key
+is recovered from the signature and must own the inputs (B7); a replacement spends the
+same coins with less change and is refused if the reservation or intent differs from the
+previous attempt (B6, B8, B13, B14). Outside the adapter it took a registry entry, the
+node's image and Compose service, one conformance-suite change and test-harness work;
+`docs/design.md` section 1 says which, and `docs/adding-a-chain.md` measures it.
 
 **Where would an HSM or MPC signer plug in?** Implement `Signer` (`src/core/signer.ts`):
-`publicKey`, and `sign` over the adapter's payload (a 32-byte digest for secp256k1).
-`buildRuntime` in `src/pipeline/runtime.ts` builds the `LocalSigner` today; `signTx` and
-`hotWallet` are the pipeline's only callers. Signing happens before the store
-transaction, so a slow or failing signer only delays a step.
+`publicKey`, and `sign` over the adapter's payload (a 32-byte digest for secp256k1),
+returning r, s and a recovery id of 0 or 1; S may be high or low, since both adapters
+send the low-S form. `buildRuntime` in `src/pipeline/runtime.ts` builds the `LocalSigner`
+today; `signTx` and `hotWallet` are the pipeline's only callers. Signing happens before
+the store transaction, so a slow or failing signer only delays a step, and a signature by
+the wrong key is refused in `attachSignatures` before anything is stored (Stop 4).
+`docs/design.md` section 7 sketches one.
 
 **What stops one request from being paid twice?** The unique `(user_id,
 idempotency_key)`, `on conflict do nothing`, and `replay`'s parameter check (R2, R9).
@@ -502,21 +568,51 @@ database snapshot, so its own comment says to confirm a failure with a second ru
 
 ## Where the code differs from the spec
 
-- `scripts/fault-run.ts` runs only the kill-at-each-crash-point scenarios and prints one
-  line per scenario; it does not write `docs/results.md` yet. Kill at random, duplicate
-  requests, dropped, reorg and stuck (spec section 11) are not in the script; the last
-  four are covered in-process by R2 and F1 to F3.
-- "Lost" in `verifyAgainstChain` is a `SETTLED` withdrawal whose destination holds less
-  than its amount, with non-terminal ones counted as unfinished; the spec says
-  "destination balance is zero". Sent twice also counts funds at a `REJECTED` or
-  `FAILED` destination.
-- `reconcile` takes `(db, chains, assets)`, reads only the hot address, explains only
-  `SIGNED` and `BROADCAST` withdrawals, and adds the `custody_covered` and
-  `one_confirmed_attempt` checks.
-- `settle` posts the fee before the amount; the spec's postings table lists them the
-  other way round.
-- `track` stops replacing at `maxAttempts`, and `broadcast` records only the latest
-  attempt; neither is in the spec's handler table.
-- Layout: `src/config.ts`, `src/chains.ts`, `src/pipeline/runtime.ts` and
-  `src/pipeline/verify.ts` exist; `src/core/json.ts`, `src/pipeline/config.ts`,
-  `scripts/demo.ts` and `scripts/reconcile.ts` do not yet.
+The spec in `docs/superpowers/specs/` was approved before the build and has since been
+brought in line with the code, each change marked "(decided during the build)". The
+changes, for a reader who knows the original:
+
+1. The fault run covers every scenario of spec section 11 on both chains (nine crash
+   points; random kills, until a minimum number caught a worker holding a withdrawal;
+   duplicates; dropped; reorg; stuck fee). It writes `docs/results.md` only for the full
+   default matrix on every chain, all passing, on a checkout that did not change.
+2. Grading waits for `finalityDepth + 1` more blocks and a node holding nothing more from
+   the hot wallet (`Devnet.pendingFrom`, C16). The hot wallet holds a token float. Each
+   scenario also checks that its own fault happened, and a scenario can declare itself
+   not applicable on a chain (none does yet).
+3. Lost is a `SETTLED` withdrawal whose destination holds less than its amount (the spec
+   said zero), non-terminal ones are unfinished, and sent twice also counts anything at a
+   `REJECTED` or `FAILED` destination.
+4. `reconcile(db, chains, assets)` reads the hot address only, explains only attempts of
+   `SIGNED` and `BROADCAST` withdrawals, adds `custody_covered` and
+   `one_confirmed_attempt`, and throws when asked to compare nothing.
+5. `settle` posts the fee before the amount.
+6. `track` stops replacing at `maxAttempts`, refuses to settle when two attempts confirm,
+   writes `reorg` and `reorged_out`, and writes `rebroadcast` only when the re-send was
+   accepted; the broadcast handler records only the latest attempt.
+7. `Devnet` has `pendingFrom` (C16) and the harness `unknownTxid()`. C13 funds its
+   wallet twice; Bitcoin needed no capability flag. C14's after-expiry form is not
+   written, and C14 skips for such a harness.
+8. Bitcoin: `@scure/btc-signer`; a node with `-txindex`; a fixed 2 sat/vB; dust refused at
+   the quote; change under 294 sat folded into the fee; replacements rebuilt from the
+   previous body and checked against the reservation and intent, at the highest of an
+   eighth more, 1 sat/vB more and the quote, and refused when no change is left; the
+   public key recovered from the signature; high S normalised; `scanBlock` reports
+   coinbase and change outputs too.
+9. `finalityDepth` defaults to 3; the tests, the fault run and the demo use 2. Each
+   `PipelineEnv` says how its node behaves (`fundingPieces`, `stuckEvicts`,
+   `reorgKeepsMempool`). On Bitcoin a stuck fee is the harness choosing what to mine.
+10. Layout: `src/chains.ts`, `src/config.ts`, `src/pipeline/runtime.ts`,
+    `src/pipeline/verify.ts`, `src/adapters/bitcoin/{adapter,devnet,rpc}.ts`,
+    `scripts/lib/*` (with `grading.ts`), `docker/bitcoind/`, `scripts/demo.ts` and
+    `scripts/reconcile.ts` exist; `src/core/json.ts` and `src/pipeline/config.ts` do not.
+11. The demo, on EVM only, also replays a request and refuses its key reused for another
+    amount, checks what it prints about the crash, the replay and the balances, and exits
+    1 if one claim does not hold.
+12. Make targets: `up` (building the bitcoind image), `down`, `test`, `typecheck`,
+    `lint`, `migrate`, `conformance`, `faults`, `demo`, `reconcile`, `chain-cost`,
+    `contracts`.
+13. From the final review: `claim` takes only chains the worker has a runtime for; the
+    24-hour limit leaves out `FAILED` as well as `REJECTED`; the EVM adapter normalises a
+    high S and ties every attempt to its sender; only approvers the policy currently
+    lists count toward M.

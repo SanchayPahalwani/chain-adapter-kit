@@ -46,6 +46,7 @@ const short = (s: string) => (s.length > 14 ? `${s.slice(0, 8)}...${s.slice(-4)}
 const shortTxid = (key: string, v: unknown) =>
   key === 'txid' && typeof v === 'string' ? short(v) : v;
 const policy: AssetPolicy = {
+  minAmount: 1n, // EVM carries a transfer of 1 wei
   perWithdrawalMax: 8n * unit,
   rolling24hMax: 20n * unit,
   approvalThreshold: 5n * unit,

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChainAdapter, SignedTx } from '../src/core/adapter.js';
@@ -6,7 +7,12 @@ import { LocalSigner } from '../src/core/local-signer.js';
 import { noCrash } from '../src/pipeline/crash.js';
 import type { Db } from '../src/pipeline/db.js';
 import { acct, balance, ledgerAsset, post } from '../src/pipeline/ledger.js';
-import { getWithdrawal, type Withdrawal, type WithdrawalState } from '../src/pipeline/requests.js';
+import {
+  getWithdrawal,
+  submitWithdrawal,
+  type Withdrawal,
+  type WithdrawalState,
+} from '../src/pipeline/requests.js';
 import { handlers, LostRace } from '../src/pipeline/steps.js';
 import {
   claim,
@@ -449,6 +455,32 @@ export function runPipelineSuite(makeEnv: () => Promise<PipelineEnv>, options: S
       expect(spy).not.toHaveBeenCalled();
       expect(await state(w.id)).toBe('SETTLED');
       expect(await env.adapter.getBalance(w.to, native)).toBe(amount);
+    });
+
+    it("P9 one below the chain's least amount is rejected at request; the least amount settles", async () => {
+      await p.credit(native, env.unit(native));
+      const below = env.minAmount - 1n;
+      // On a chain that carries any positive amount there is nothing below it: an amount of zero
+      // or less is a caller error (R20).
+      if (below >= 1n) {
+        const w = await submitWithdrawal(p.db, p.requestDeps, {
+          idempotencyKey: randomUUID(),
+          userId: p.userId,
+          chain: env.chain,
+          asset: native,
+          to: await p.allowFresh(),
+          amount: below,
+        });
+        expect([w.state, w.rejectReason]).toEqual(['REJECTED', 'below_minimum']);
+        expect(await postings(w.id)).toEqual([]); // no hold
+        expect(await runOnce(p.deps, 'one')).toBe(false); // nothing for a worker to do
+      }
+      // what the policy accepts, the chain carries
+      const least = await p.withdraw(native, env.minAmount);
+      await drive(p.deps, env, terminal(p.db, least.id));
+      expect(await state(least.id)).toBe('SETTLED');
+      expect(await env.adapter.getBalance(least.to, native)).toBe(env.minAmount);
+      expect(await balance(p.db, acct.user(p.userId, n()))).toBe(env.unit(native) - env.minAmount);
     });
 
     // APPROVED to BROADCAST in three steps, with nothing mined: the only attempt is pending.

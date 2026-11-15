@@ -315,7 +315,7 @@ async function duplicateRequests(
   const limit = (asset: AssetId) => 10n * env.unit(asset);
   const deps: RequestDeps = {
     ...box.requestDeps,
-    policy: (_chain, asset) => ({ ...sandboxPolicy, perWithdrawalMax: limit(asset) }),
+    policy: (_chain, asset) => ({ ...sandboxPolicy(env), perWithdrawalMax: limit(asset) }),
   };
   const request = (asset: AssetId, amount: bigint, to: string): WithdrawalRequest => ({
     idempotencyKey: randomUUID(),

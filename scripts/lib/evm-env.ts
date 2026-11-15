@@ -44,6 +44,7 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     nodeOverride: nodeOverride('EVM_RPC_URL', config.evmRpcUrl, defaults.evmRpcUrl),
     assets: ['native', token],
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
+    minAmount: 1n, // a transfer of 1 wei, or 1 base unit of the token, is carried
     freshAddress: async () =>
       adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
     workerEnv: {

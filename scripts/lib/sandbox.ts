@@ -62,13 +62,14 @@ async function fundInPieces(env: PipelineEnv, address: string, asset: AssetId, a
 }
 
 const unlimited = 10n ** 40n;
-export const sandboxPolicy: AssetPolicy = {
+export const sandboxPolicy = (env: PipelineEnv): AssetPolicy => ({
+  minAmount: env.minAmount, // the least the chain carries
   perWithdrawalMax: unlimited,
   rolling24hMax: unlimited,
   approvalThreshold: unlimited, // never asks for approval
   approvalsRequired: 1,
   approvers: ['ops'],
-};
+});
 
 /** A fresh schema, a fresh hot wallet funded on-chain and in the ledger, one user. */
 export interface Sandbox extends TestDb {
@@ -76,7 +77,7 @@ export interface Sandbox extends TestDb {
   hot: ChainRuntime;
   chains: Record<string, ChainRuntime>;
   userId: string;
-  requestDeps: RequestDeps; // sandboxPolicy, and the adapter's address check
+  requestDeps: RequestDeps; // sandboxPolicy(env), and the adapter's address check
   /** A deposit: the user is owed `amount` and the hot wallet holds it on-chain. */
   credit(asset: AssetId, amount: bigint): Promise<void>;
   /** A fresh address, on the user's allowlist. */
@@ -105,8 +106,9 @@ export async function openSandbox(
   try {
     const signer = LocalSigner.random();
     const hot = await hotWallet(env.adapter, signer);
+    const policy = sandboxPolicy(env);
     const requestDeps: RequestDeps = {
-      policy: () => sandboxPolicy,
+      policy: () => policy,
       validateAddress: (chain, address) =>
         chain === env.chain && env.adapter.validateAddress(address),
     };

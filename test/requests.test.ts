@@ -28,6 +28,7 @@ const CHAIN = 'evm-anvil';
 const ASSET = 'native';
 const A = ledgerAsset(CHAIN, ASSET);
 const policy: AssetPolicy = {
+  minAmount: 1n,
   perWithdrawalMax: 500n,
   rolling24hMax: 1000n,
   approvalThreshold: 300n,
@@ -418,6 +419,13 @@ describe('withdrawal requests', () => {
     await expect(submitWithdrawal(t.db, twice, req('k21', 300n))).rejects.toThrow(
       'approver ops1 is listed more than once',
     );
+    // a number or a missing value, as a policy read from configuration might hold
+    for (const minAmount of [0n, -1n, 1, undefined] as unknown as bigint[]) {
+      const using = withPolicy({ minAmount });
+      await expect(submitWithdrawal(t.db, using, req('k21', 300n))).rejects.toThrow(
+        /minAmount must be a bigint of at least 1n/,
+      );
+    }
     const unknown: RequestDeps = {
       ...deps,
       policy: (c, a) => {
@@ -470,6 +478,29 @@ describe('withdrawal requests', () => {
       `user id "a:b" contains ':', which account names use`,
     );
     expect(await count('withdrawals')).toBe(0);
+  });
+
+  it('R24 below the minimum is a recorded rejection, with no hold; the minimum itself passes', async () => {
+    const strict = withPolicy({ minAmount: 100n });
+    const below = await submitWithdrawal(t.db, strict, req('k24a', 99n));
+    expect([below.state, below.rejectReason]).toEqual(['REJECTED', 'below_minimum']);
+    expect(await getWithdrawal(t.db, below.id)).toEqual(below);
+    expect(await postingKind(`hold:${below.id}`)).toBeNull();
+    expect(await userBal()).toBe(2000n);
+    expect(await inFlight()).toBe(0n);
+    expect(await submitWithdrawal(t.db, strict, req('k24a', 99n))).toEqual(below); // a replay
+
+    // the address checks come first; the minimum before the limits
+    const bad = await submitWithdrawal(t.db, strict, req('k24b', 99n, { to: '0xBAD' }));
+    expect(bad.rejectReason).toBe('invalid_address');
+    const both = withPolicy({ minAmount: 100n, perWithdrawalMax: 50n });
+    expect((await submitWithdrawal(t.db, both, req('k24c', 99n))).rejectReason).toBe(
+      'below_minimum',
+    );
+
+    const at = await submitWithdrawal(t.db, strict, req('k24d', 100n));
+    expect([at.state, at.rejectReason]).toEqual(['APPROVED', null]);
+    expect(await userBal()).toBe(1900n);
   });
 
   it('R22 a decision on an unknown or malformed withdrawal id throws a clear error', async () => {

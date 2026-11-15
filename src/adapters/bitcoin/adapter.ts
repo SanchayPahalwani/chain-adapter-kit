@@ -19,8 +19,9 @@ export const REGTEST = { bech32: 'bcrt', pubKeyHash: 0x6f, scriptHash: 0xc4, wif
 // Signals that the transaction may be replaced (BIP-125); Core 32 replaces any transaction anyway.
 const SEQUENCE = 0xfffffffd;
 // The smallest P2WPKH output the node relays (dust rate 3 sat/vB). Smaller change would get the
-// whole transaction refused, so it goes to the fee instead.
-const DUST = 294n;
+// whole transaction refused, so it goes to the fee instead, and quoteFee refuses a smaller amount.
+// A policy's minAmount for this chain must be at least this (AssetPolicy in src/pipeline/policy.ts).
+export const DUST_SAT = 294n;
 
 // The opaque JSON values this adapter hands the pipeline. Every amount is a decimal string.
 type Fee = { feeRate: string }; // sat/vB
@@ -92,7 +93,7 @@ function assemble(intent: TransferIntent, coins: Coins, rate: bigint, what = 'tr
   const change = total - intent.amount - fee;
   if (change < 0n)
     throw new Error(`cannot afford ${what} at ${rate} sat/vB: the coins hold ${total} sat`);
-  if (change >= DUST) tx.addOutputAddress(intent.from, change, REGTEST);
+  if (change >= DUST_SAT) tx.addOutputAddress(intent.from, change, REGTEST);
   const { from } = intent;
   const body: Body = { tx: bytesToHex(tx.unsignedTx), from, amounts: amounts.map(String) };
   return { body, signingPayloads: digests(tx, from, amounts).map((d) => bytesToHex(d)) };
@@ -182,8 +183,8 @@ export async function createBitcoinAdapter(opts: BitcoinAdapterOptions): Promise
     async quoteFee(intent): Promise<Fee> {
       native(intent.asset);
       // checked here, before any coin is reserved: the node relays no output this small
-      if (intent.amount < DUST)
-        throw new Error(`${intent.amount} sat is below the ${DUST} sat dust limit`);
+      if (intent.amount < DUST_SAT)
+        throw new Error(`${intent.amount} sat is below the ${DUST_SAT} sat dust limit`);
       return { feeRate: marketRate().toString() };
     },
 

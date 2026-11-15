@@ -26,6 +26,9 @@ export interface PipelineEnv {
   nodeOverride?: string; // set when the environment chose the node (nodeOverride above)
   assets: AssetId[]; // 'native' first
   unit(asset: AssetId): bigint;
+  // the least amount the chain carries in one transfer, whatever the asset (Bitcoin's dust
+  // limit): the sandbox policy's minAmount, so that what the policy accepts the chain can carry
+  minAmount: bigint;
   freshAddress(): Promise<string>; // a valid address nobody else uses
   // what a worker process needs in its environment to build this same adapter (src/chains.ts)
   workerEnv: Record<string, string>;

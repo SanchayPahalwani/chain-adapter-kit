@@ -1,4 +1,8 @@
-import { DEFAULT_FEE_RATE, createBitcoinAdapter } from '../../src/adapters/bitcoin/adapter.js';
+import {
+  DEFAULT_FEE_RATE,
+  DUST_SAT,
+  createBitcoinAdapter,
+} from '../../src/adapters/bitcoin/adapter.js';
 import { createBitcoinDevnet } from '../../src/adapters/bitcoin/devnet.js';
 import type { Devnet } from '../../src/conformance/harness.js';
 import { config, defaults } from '../../src/config.js';
@@ -36,6 +40,7 @@ export async function makeBitcoinEnv(): Promise<PipelineEnv> {
     nodeOverride: nodeOverride('BITCOIN_RPC_URL', rpcUrl, defaults.bitcoinRpcUrl),
     assets: ['native'],
     unit: () => 100_000n, // sat
+    minAmount: DUST_SAT, // the node relays no smaller output, and quoteFee refuses one
     freshAddress: async () =>
       adapter.deriveAddress(await LocalSigner.random().publicKey('destination', adapter.curve)),
     workerEnv: {

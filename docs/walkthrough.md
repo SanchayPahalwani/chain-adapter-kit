@@ -49,9 +49,10 @@ the EVM adapter does not use it.
 Before a transaction opens, an amount of zero or less throws `RangeError`, and so does a
 user id containing `:`, which ledger account names use as a separator (R23). The policy
 is read with `deps.policy(chain, asset)` (an unknown asset throws there), and
-`assertValidPolicy` checks that M is an integer between 1 and the number of approvers and
-that no approver is listed twice. A configuration error writes nothing; it never becomes
-a rejection row (R20, R21). Then one transaction:
+`assertValidPolicy` checks that the minimum amount is a bigint of at least 1, that M is an
+integer between 1 and the number of approvers, and that no approver is listed twice. A
+configuration error writes nothing; it never becomes a rejection row (R20, R21). Then one
+transaction:
 
 1. **Idempotency.** The row is inserted with state `'APPROVED'` and
    `on conflict (user_id, idempotency_key) do nothing returning *`. No row back means the
@@ -66,11 +67,13 @@ a rejection row (R20, R21). Then one transaction:
    post only to accounts that sort at or after the locked one, as `user:...` and
    `withdrawals_in_flight:...` do.
 3. **Policy, in order** (`checkRequest` in `src/pipeline/policy.ts`, first failure
-   wins): `invalid_address`, `not_allowlisted`, `over_withdrawal_limit`,
-   `over_24h_limit`. The 24-hour total (`recentTotal`) sums the user's other
-   withdrawals of the same chain and asset created in the last 24 hours by `now()`, the
-   database clock, not the process clock, leaving out `REJECTED` and `FAILED` ones,
-   whose holds were never placed or were released (R5, R6, R6b).
+   wins): `invalid_address`, `not_allowlisted`, `below_minimum` (under `minAmount`,
+   which a deployment sets at least to the chain's smallest transferable amount, such as
+   Bitcoin's 294 sat dust limit, so nothing the chain cannot carry is accepted; R24),
+   `over_withdrawal_limit`, `over_24h_limit`. The 24-hour total (`recentTotal`) sums
+   the user's other withdrawals of the same chain and asset created in the last 24 hours
+   by `now()`, the database clock, not the process clock, leaving out `REJECTED` and
+   `FAILED` ones, whose holds were never placed or were released (R5, R6, R6b).
 4. **The hold, in a savepoint.** `placeHold` posts `hold:<id>`: debit the user, credit
    `withdrawals_in_flight`. A short balance fails the check constraint, which `post`
    turns into `InsufficientFunds`. A failed statement aborts a Postgres transaction, so
@@ -616,3 +619,6 @@ changes, for a reader who knows the original:
     24-hour limit leaves out `FAILED` as well as `REJECTED`; the EVM adapter normalises a
     high S and ties every attempt to its sender; only approvers the policy currently
     lists count toward M.
+14. A minimum amount per asset (`minAmount`, rejected as `below_minimum` before the
+    limits), so a Bitcoin withdrawal below the dust limit is refused at request instead of
+    waiting in `APPROVED` with its hold.

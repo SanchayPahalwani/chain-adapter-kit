@@ -237,9 +237,11 @@ transaction construction without PSBTs, and the BIP-143 digest of each input
 (`preimageWitnessV0`), which the adapter returns as signing payloads instead of signing.
 It depends on `@noble/curves` and `@noble/hashes`, which the kit already uses for the
 local signer, at the same versions, plus two small packages by the same author
-(`@scure/base`, `micro-packed`). The alternative was `bitcoinjs-lib`. It produced
-byte-identical digests and transactions in a comparison during the build, but pulls in
-several more packages, among them an older major version of `@noble/hashes`.
+(`@scure/base`, `micro-packed`). The alternative was `bitcoinjs-lib`, which pulls in
+several more packages, among them an older major version of `@noble/hashes`. That it
+produces the same digests and transactions byte for byte was checked once during the
+build, by comparing the two libraries' output; the comparison is not recorded in this
+repository.
 
 The node is reached through a small JSON-RPC client over `fetch` (`bitcoinRpc` in
 `src/adapters/bitcoin/rpc.ts`), not a Bitcoin RPC library. The adapter and its devnet
@@ -250,11 +252,32 @@ answer in time, a non-2xx status) is a plain error.
 The node is Bitcoin Core in regtest, from an image built by `docker/bitcoind/Dockerfile`
 from the official release tarball. Its SHA-256 is pinned per architecture and checked by
 `sha256sum -c` in the image build; the pinned values are the release's own, from its
-`SHA256SUMS` file, whose GPG signatures were checked when the hashes were recorded (the
-Dockerfile's header says how to repeat that for a new version). The node must run with
-`-txindex`: `getTxStatus` finds a confirmed transaction by its id alone, which needs the
-transaction index, and `createBitcoinAdapter` refuses a node whose index is missing or not
-synced (B11). Compose starts it with `-txindex=1`.
+`SHA256SUMS` file (the Dockerfile's header says how to update them for a new version).
+The file's GPG signatures (`SHA256SUMS.asc`) were checked against the builders' keys once
+during the build, when the hashes were recorded; that check is not recorded in this
+repository. To repeat it, from the repository root:
+
+```sh
+repo=$PWD
+v=32.1 # BITCOIN_VERSION in docker/bitcoind/Dockerfile
+cd "$(mktemp -d)"
+curl -fsSLO "https://bitcoincore.org/bin/bitcoin-core-$v/SHA256SUMS"
+curl -fsSLO "https://bitcoincore.org/bin/bitcoin-core-$v/SHA256SUMS.asc"
+git clone --depth 1 https://github.com/bitcoin-core/guix.sigs
+gpg --import guix.sigs/builder-keys/*
+gpg --verify SHA256SUMS.asc SHA256SUMS
+grep -E "bitcoin-$v-(aarch64|x86_64)-linux-gnu\.tar\.gz$" SHA256SUMS
+grep -E '^ARG SHA256_(ARM64|AMD64)=' "$repo/docker/bitcoind/Dockerfile"
+```
+
+`gpg --verify` prints a `Good signature` line for each builder whose signature it could
+check; which builders to trust is the reader's call. The two hashes the first `grep`
+prints must be the two the second prints: `aarch64` is `SHA256_ARM64`, `x86_64` is
+`SHA256_AMD64`.
+
+The node must run with `-txindex`: `getTxStatus` finds a confirmed transaction by its id
+alone, which needs the transaction index, and `createBitcoinAdapter` refuses a node whose
+index is missing or not synced (B11). Compose starts it with `-txindex=1`.
 
 ## 3. The withdrawal state machine
 
@@ -539,8 +562,17 @@ user's other withdrawals of the chain and asset created in the last 24 hours, by
 database clock, except `REJECTED` and `FAILED` ones: a rejected request's hold was
 never placed or was released, and a failed one's was released when it ended (R6, R6b).
 In-flight and `SETTLED` withdrawals count. The checks run in order and the first failure
-is the recorded reason: address format, allowlist, per-withdrawal limit, 24-hour limit
-(`checkRequest` in `src/pipeline/policy.ts`).
+is the recorded reason: address format, allowlist, minimum amount (`below_minimum`),
+per-withdrawal limit, 24-hour limit (`checkRequest` in `src/pipeline/policy.ts`).
+
+**The minimum is the chain's floor.** `minAmount` is at least 1, and a deployment sets it
+at least to the smallest amount the chain carries, such as Bitcoin's 294 sat dust limit
+(`DUST_SAT` in `src/adapters/bitcoin/adapter.ts`). Below it a request is rejected with no
+hold (R24), so nothing is accepted that the chain would refuse at every `reserve`. The
+request path stays chain-agnostic: the policy carries the chain's limit, the pipeline does
+not ask the adapter. Each chain's `PipelineEnv` states its minimum, which the test sandbox
+uses as its policy's. P9 checks on each chain that the minimum itself settles, and, where
+the minimum is above 1 (Bitcoin), that one base unit less is rejected at request.
 
 **The hold comes before approvals.** It is posted in the same transaction, in a savepoint,
 so an overdraft becomes the recorded rejection `insufficient_funds` instead of aborting the
@@ -560,12 +592,13 @@ that `approve` into `reject`, the hold is released, and the withdrawal ends `REJ
 out inside the system, since approvals never expire.
 
 **Errors throw; outcomes are recorded.** An amount of zero or less, a user id containing
-`:` (ledger account names are colon-separated), a policy whose M is outside 1 to N or that
-lists an approver twice, or a policy lookup that throws (`deps.policy`, for an asset with
-no policy) is a caller or configuration error: `submitWithdrawal` throws before touching
-the database, and the key is not consumed (R20, R21, R23). A policy outcome (not
-allowlisted, over a limit, short of funds) is a `REJECTED` row, returned again on every
-replay (R8). The line: could the same request ever succeed if retried?
+`:` (ledger account names are colon-separated), a policy whose minimum is not a bigint of
+at least 1, whose M is outside 1 to N or that lists an approver twice, or a policy lookup
+that throws (`deps.policy`, for an asset with no policy) is a caller or configuration
+error: `submitWithdrawal` throws before touching the database, and the key is not consumed
+(R20, R21, R23). A policy outcome (not allowlisted, below the minimum, over a limit, short
+of funds) is a `REJECTED` row, returned again on every replay (R8, R24). The line: could
+the same request ever succeed if retried?
 
 **What a real policy engine adds:** velocity rules across assets in a common currency,
 address screening, a time lock for new allowlist entries, quorums that grow with the
@@ -694,7 +727,7 @@ reservation. Where a node cannot produce a condition, its devnet emulates it rat
 the suite skipping it: Bitcoin Core cannot remove one transaction from its mempool, so
 `dropFromMempool` moves the node's clock past the mempool expiry and resubmits the rest.
 
-**The pipeline suite.** `runPipelineSuite(makeEnv, options)` runs P1 to P8, F1 to F7 and
+**The pipeline suite.** `runPipelineSuite(makeEnv, options)` runs P1 to P9, F1 to F7 and
 tests of the pipeline's defensive branches (such as two attempts reported confirmed, an
 attempt replaced during its broadcast, a settlement already posted, a duplicate `txid`)
 with in-process workers on each chain's `PipelineEnv` (`scripts/lib/env.ts`). The env
@@ -857,12 +890,12 @@ than letting the queue age silently.
 - **A withdrawal for a chain no running worker serves waits until one does.** `claim`
   passes it over, so it stays in its state with its hold, untouched and with no error, and
   nothing alerts.
-- **A request the chain cannot carry waits instead of being refused.** The request path
-  checks the address and the policy, not the chain's own limits. A Bitcoin withdrawal
-  below the 294 sat dust limit is accepted, and then `quoteFee` refuses it on every retry
-  of `reserve`, so it holds the user's funds in `APPROVED`, with the reason in
-  `last_error`, and no path in the kit ends it. A minimum amount in the policy, which
-  `AssetPolicy` does not have, would keep it out.
+- **The minimum amount is a policy rule** (`AssetPolicy.minAmount`, rejected as
+  `below_minimum`), not a question put to the adapter, so the request path stays
+  chain-agnostic; the price is that a deployment must set it at least to the chain's
+  smallest transferable amount (294 sat on Bitcoin), or a request the chain cannot carry
+  is accepted, refused by `quoteFee` at every `reserve`, and holds the user's funds with
+  nothing to end it.
 - **Funding in many coins exists only in the devnet.** The tests and the fault run give
   the Bitcoin hot wallet a coin per withdrawal in flight (`fundingPieces`, paid in one
   transaction by `fundMany` in `src/adapters/bitcoin/devnet.ts`). The kit itself never

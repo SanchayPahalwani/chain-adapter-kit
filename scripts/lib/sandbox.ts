@@ -33,7 +33,7 @@ export async function createTestDb(): Promise<TestDb> {
       await db.end({ timeout: 5 }); // a test that timed out may leave a transaction open
       if (!keepSchema) await admin`drop schema if exists ${admin(schema)} cascade`;
     } finally {
-      await admin.end();
+      await admin.end({ timeout: 5 });
     }
   }
   try {
@@ -49,14 +49,16 @@ export async function createTestDb(): Promise<TestDb> {
 // native the hot wallet holds for fees, booked as the platform's own
 export const gasFloat = (env: PipelineEnv) => 100n * env.unit('native');
 
-// `amount` on-chain in env.fundingPieces payments, the last with the remainder, so a chain that
+// `amount` on-chain in env.fundingPieces pieces, the last with the remainder, so a chain that
 // spends coins gets that many coins, each one for a withdrawal in flight
 async function fundInPieces(env: PipelineEnv, address: string, asset: AssetId, amount: bigint) {
   const n = BigInt(env.fundingPieces);
   const piece = amount / n;
-  for (let i = 1n; i <= n; i++) {
-    await env.devnet.fund(address, asset, i < n ? piece : amount - piece * (n - 1n));
-  }
+  const pieces = Array.from({ length: env.fundingPieces }, (_, i) =>
+    BigInt(i) < n - 1n ? piece : amount - piece * (n - 1n),
+  );
+  if (env.fundMany && pieces.length > 1) return env.fundMany(address, asset, pieces);
+  for (const p of pieces) await env.devnet.fund(address, asset, p);
 }
 
 const unlimited = 10n ** 40n;

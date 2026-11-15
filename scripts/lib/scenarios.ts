@@ -1,7 +1,9 @@
-// The fault-injection scenarios (spec section 11), one function each. Every scenario runs on a
-// fresh sandbox, makes its fault while worker processes run the pipeline, and ends the same way:
+// The fault-injection scenarios (spec section 11): each scenario's function, then the description
+// docs/results.md prints for it. Every scenario runs on a fresh sandbox, makes its fault while
+// worker processes run the pipeline, and ends the same way (finish in scripts/lib/grading.ts):
 // extra blocks, an empty mempool, the destinations' balances on the chain, and reconciliation.
-// Chain-specific steps go through PipelineEnv, so another chain needs another env, not new code.
+// Chain-specific steps go through PipelineEnv: another chain needs its PipelineEnv and an entry in
+// the envs map of scripts/fault-run.ts, not new scenario code.
 import { randomUUID } from 'node:crypto';
 import { openSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,16 +13,27 @@ import { config } from '../../src/config.js';
 import { startMiner } from '../../src/conformance/harness.js';
 import type { AssetId } from '../../src/core/adapter.js';
 import { crashPoints, type CrashPoint } from '../../src/pipeline/crash.js';
-import { connect, type Db } from '../../src/pipeline/db.js';
-import { reconcile } from '../../src/pipeline/reconcile.js';
+import { connect } from '../../src/pipeline/db.js';
 import {
   submitWithdrawal,
   type RequestDeps,
   type Withdrawal,
   type WithdrawalRequest,
 } from '../../src/pipeline/requests.js';
-import { verifyAgainstChain, type Verdict } from '../../src/pipeline/verify.js';
 import type { PipelineEnv } from './env.js';
+import {
+  allAttempts,
+  count,
+  everyIs,
+  finish,
+  firstAttempts,
+  notSettledOn,
+  unfinished,
+  withEvent,
+  withFewerAttempts,
+  withoutEvent,
+  type Graded,
+} from './grading.js';
 import { openSandbox, sandboxPolicy } from './sandbox.js';
 import {
   supervise,
@@ -30,17 +43,7 @@ import {
   type SuperviseOptions,
   type WorkerOptions,
 } from './supervisor.js';
-import { byDeadline, seconds, startMinerWhen } from './waits.js';
-
-/** How a scenario went, by the chain: what docs/results.md shows, and why it failed if it did. */
-export interface Graded {
-  kills: number;
-  killsMidHandler: number; // supervisor kills that caught a worker holding a withdrawal
-  verdict: Verdict;
-  drift: bigint; // the largest absolute reconciliation drift over the scenario's assets
-  problems: string[]; // why the scenario failed, failed reconciliation checks included
-  note?: string; // how this run's fault landed, for its line and docs/results.md
-}
+import { clock, mining, startMinerWhen, type Clock } from './waits.js';
 
 export interface FaultRun extends Run {
   env: PipelineEnv;
@@ -68,37 +71,9 @@ const timings: WorkerOptions['timings'] = {
 };
 const STALE_MS = 1500; // stuckAfterMs where a scenario wants replacements
 const MINE_EVERY_MS = 100;
-const RANDOM_WORKERS = 4;
-const KILL_EVERY_MS: [number, number] = [150, 600]; // between kill attempts
-// Random kills spare a worker for its first KILL_AFTER_MS past start-up, so each worker gets to
-// work however long start-up takes. Under load four workers took up to 4 s to start, and with a
-// kill every few hundred ms they did little else. A withdrawal took 0.1 to 1.3 s of worker time
-// at loads of 7 to 23 on 12 cores, so 1.5 s covers at least one withdrawal's steps.
-const KILL_AFTER_MS = 1500;
-// Random kills submits RANDOM_BATCH withdrawals at a time, whenever fewer than that are unfinished,
-// until at least RANDOM_COUNT were submitted and RANDOM_HELD_KILLS kills caught a worker holding a
-// withdrawal: on a fast machine a fixed count can finish before many kills happen. The user is
-// credited up front for RANDOM_MAX, the most it submits.
-const RANDOM_BATCH = 20;
-const RANDOM_COUNT = { full: 100, quick: 40 };
-const RANDOM_HELD_KILLS = { full: 20, quick: 3 };
-const RANDOM_MAX = 1500;
-const RANDOM_BUDGET_MS = { base: 60_000, perWithdrawal: 2_000 }; // grading included
-const randomBudgetFor = (n: number) => RANDOM_BUDGET_MS.base + RANDOM_BUDGET_MS.perWithdrawal * n;
-const RANDOM_SETTLE_MS = 30_000; // the workers' time left after the last batch, for the backlog
-const COPIES = 5; // concurrent submissions of each request, one database connection each
-const REFUSALS = ['not_allowlisted', 'over_withdrawal_limit'] as const;
 const budgetFor = (n: number) => 30_000 + 10_000 * n; // the whole scenario, grading included
 const GRADING_MS = 20_000; // the end of each scenario's time, kept for grading
 
-interface Clock {
-  started: number;
-  deadline: number;
-}
-function clock(ms: number): Clock {
-  const started = Date.now();
-  return { started, deadline: started + ms };
-}
 const forWorkers = (c: Clock) => c.deadline - GRADING_MS - Date.now();
 const none: Supervised = { kills: 0, killsMidHandler: 0, timedOut: false };
 const add = (a: Supervised, b: Supervised): Supervised => ({
@@ -136,40 +111,6 @@ async function submitMany(run: FaultRun, n: number): Promise<void> {
   for (const w of await creditFor(run, n)) await run.box.withdraw(w.asset, w.amount);
 }
 
-const count = async (rows: Promise<{ n: number }[]>) => (await rows)[0]?.n ?? 0;
-const unfinished = (db: Db) =>
-  count(db`
-    select count(*)::int as n from withdrawals where state not in ('SETTLED','FAILED','REJECTED')`);
-const everyIs = (db: Db, state: string) => async () =>
-  (await count(db`select count(*)::int as n from withdrawals where state <> ${state}`)) === 0;
-const withoutEvent = (db: Db, kind: string) =>
-  count(db`
-    select count(*)::int as n from withdrawals w
-     where not exists (select 1 from withdrawal_events e
-                        where e.withdrawal_id = w.id and e.kind = ${kind})`);
-const withFewerAttempts = (db: Db, min: number) =>
-  count(db`
-    select count(*)::int as n from withdrawals w
-     where (select count(*) from tx_attempts t where t.withdrawal_id = w.id) < ${min}`);
-// withdrawals that did not settle on one of their attempts numbered `from` to `to`
-const notSettledOn = (db: Db, from: number, to: number) =>
-  count(db`
-    select count(*)::int as n from withdrawals w
-     where not exists (select 1 from tx_attempts t
-                        where t.withdrawal_id = w.id and t.txid = w.settled_txid
-                          and t.attempt_no between ${from} and ${to})`);
-const txids = async (rows: Promise<{ txid: string }[]>) => (await rows).map((r) => r.txid);
-const allAttempts = (db: Db) => txids(db`select txid from tx_attempts`);
-const firstAttempts = (db: Db) => txids(db`select txid from tx_attempts where attempt_no = 1`);
-
-async function mining<T>(stopMiner: () => Promise<void>, work: () => Promise<T>): Promise<T> {
-  try {
-    return await work();
-  } finally {
-    await stopMiner();
-  }
-}
-
 type WorkUntil = (until: () => Promise<boolean>) => Promise<boolean>;
 
 /**
@@ -199,50 +140,6 @@ async function faultAtBroadcast(
   return add(sup, rest);
 }
 
-// Reads the chain only once nothing more can change on it: whatever the workers sent is mined in
-// and final, and the node holds nothing else from the hot wallet. A transaction still held (one
-// behind a nonce gap, say) could move money after the balances were read.
-async function grade(run: FaultRun) {
-  const { env, box } = run;
-  await env.devnet.mine(env.adapter.finalityDepth + 1);
-  const left = await env.devnet.pendingFrom(box.hot.hotAddress);
-  const verdict = await verifyAgainstChain(box.db, box.chains);
-  const report = await reconcile(box.db, box.chains, { [env.chain]: env.assets });
-  return { left, verdict, report };
-}
-
-interface Expected {
-  settled: number;
-  rejected?: number;
-  check?: () => Promise<string[]>; // the scenario's own problems: did its fault happen at all
-  note?: string;
-}
-
-/** How every scenario ends, under its deadline: grade(), then the problems that fail it. */
-async function finish(run: FaultRun, c: Clock, sup: Supervised, e: Expected): Promise<Graded> {
-  const problems: string[] = [];
-  if (sup.timedOut) problems.push(`timed out after ${seconds(c.started)} s`);
-  const check = e.check ?? (() => Promise.resolve([]));
-  const graded = (async () => ({ ...(await grade(run)), own: await check() }))();
-  const { left, verdict, report, own } = await byDeadline(c.deadline, c.started, graded);
-  const abs = (x: bigint) => (x < 0n ? -x : x);
-  const drift = report.rows.reduce((max, r) => (abs(r.drift) > max ? abs(r.drift) : max), 0n);
-  const { sentTwice, lost, unfinished, settled, rejected } = verdict;
-  if (left > 0) problems.push(`transactions left in the mempool: ${left}`);
-  if (sentTwice + lost + unfinished > 0) problems.push('sent twice, lost or unfinished');
-  // every accepted withdrawal here is valid and funded: a fault must not change how one ends
-  if (settled !== e.settled) problems.push(`${settled} of ${e.settled} settled`);
-  const refused = e.rejected ?? 0;
-  if (rejected !== refused) problems.push(`${rejected} rejected, expected ${refused}`);
-  if (drift !== 0n) problems.push(`reconciliation drift ${drift}`);
-  for (const r of report.checks.filter((r) => !r.ok)) {
-    problems.push(`reconciliation check ${r.name}: ${r.detail}`);
-  }
-  problems.push(...own);
-  const { kills, killsMidHandler } = sup;
-  return { kills, killsMidHandler, verdict, drift, problems, note: e.note };
-}
-
 // One worker at a time, each started with `point` switched on. Each withdrawal kills a worker
 // there once (killOnce), and the next worker carries on from what had been committed.
 async function killAt(
@@ -270,15 +167,71 @@ async function killAt(
     const problems: string[] = [];
     if (sup.kills !== injected) problems.push(`${sup.kills} kills, ${injected} crash_injected`);
     if (sup.kills < n) problems.push(`${sup.kills} kills for ${n} withdrawals`);
+    if (point === 'after_broadcast') {
+      // The killed worker sent attempt 1 only after the node said it did not have it, and nothing
+      // else sends while the state is SIGNED. So a restarted worker that finds it on the node
+      // (sent: false, already_known) proves the killed worker's send was accepted, and that it
+      // was not sent again.
+      const notFound = await count(box.db`
+        select count(*)::int as n from tx_attempts t
+         where t.attempt_no = 1 and not exists (
+           select 1 from withdrawal_events e
+            where e.withdrawal_id = t.withdrawal_id and e.kind = 'broadcast'
+              and e.data->>'txid' = t.txid and e.data->>'sent' = 'false'
+              and e.data->>'outcome' = 'already_known')`);
+      if (notFound > 0) {
+        problems.push(
+          `${notFound} first attempts were not found on the node by the restarted worker`,
+        );
+      }
+    }
     return problems;
   };
   return finish(run, c, sup, { settled: n, check });
 }
 
-// No crash point: the supervisor kills the workers itself, wherever they happen to be. A kill
-// that leaves a withdrawal leased to the dead worker interrupted a handler; `held` of those are
-// required. Withdrawals are submitted only once the workers can be killed, so the kills meet the
-// work from its start (SuperviseOptions.submit), and then in batches until there were enough.
+const where: Record<CrashPoint, string> = {
+  after_reserve: 'after the reservation (nonce or coins) and fee are committed, before signing',
+  after_sign: 'after signing in memory, before the attempt is stored',
+  after_store: 'after the signed attempt is committed, before it is sent',
+  before_broadcast: 'after the node said it does not have the transaction, just before the send',
+  after_broadcast:
+    'after the node accepted the transaction, before the broadcast is recorded; the restarted ' +
+    'worker must find each transaction on the node and record its broadcast without sending it',
+  after_broadcast_recorded: 'right after the broadcast is recorded',
+  before_settle: 'after the transaction is seen final, before the settlement is posted',
+  after_settle: 'right after the settlement is committed',
+  after_replacement_store:
+    'after a replacement is stored, before it is sent; blocks wait until every withdrawal has ' +
+    `one (an attempt is stale after ${STALE_MS / 1000} s), and each withdrawal then settles on ` +
+    'whichever of its attempts confirms, the original or a replacement',
+};
+
+const killScenarios = crashPoints.map((point): Scenario => ({
+  name: point,
+  title: `kill at ${point}`,
+  about: `killed ${where[point]}.`,
+  run: (run, n, interrupt) => killAt(run, point, n, interrupt),
+}));
+
+const RANDOM_WORKERS = 4;
+const KILL_EVERY_MS: [number, number] = [150, 600]; // between kill attempts
+// Random kills spare a worker for its first KILL_AFTER_MS past start-up, so each worker gets to
+// work however long start-up takes. Under load four workers took up to 4 s to start, and with a
+// kill every few hundred ms they did little else. A withdrawal took 0.1 to 1.3 s of worker time
+// at loads of 7 to 23 on 12 cores, so 1.5 s covers at least one withdrawal's steps.
+const KILL_AFTER_MS = 1500;
+const RANDOM_BATCH = 20;
+const RANDOM_COUNT = { full: 100, quick: 40 };
+const RANDOM_HELD_KILLS = { full: 20, quick: 3 };
+const RANDOM_MAX = 1500; // the most it submits; the user is credited for all of them up front
+const RANDOM_BUDGET_MS = { base: 60_000, perWithdrawal: 2_000 }; // grading included
+const randomBudgetFor = (n: number) => RANDOM_BUDGET_MS.base + RANDOM_BUDGET_MS.perWithdrawal * n;
+const RANDOM_SETTLE_MS = 30_000; // the workers' time left after the last batch, for the backlog
+
+// A kill that leaves a withdrawal leased to the dead worker interrupted a handler. Withdrawals are
+// submitted only once the workers can be killed, so the kills meet the work from its start
+// (SuperviseOptions.submit): on a fast machine a fixed count can finish before many kills happen.
 async function randomKills(
   run: FaultRun,
   n: number,
@@ -286,7 +239,7 @@ async function randomKills(
   quick: boolean,
 ): Promise<Graded> {
   const { box } = run;
-  const held = RANDOM_HELD_KILLS[quick ? 'quick' : 'full'];
+  const heldKills = RANDOM_HELD_KILLS[quick ? 'quick' : 'full'];
   const c = clock(randomBudgetFor(n));
   const plan = await creditFor(run, RANDOM_MAX);
   const lastBatchBy = c.deadline - GRADING_MS - RANDOM_SETTLE_MS;
@@ -296,7 +249,7 @@ async function randomKills(
     killEveryMs: KILL_EVERY_MS,
     killAfterMs: KILL_AFTER_MS,
     submit: async (sofar) => {
-      while (submitted < n || sofar().killsMidHandler < held) {
+      while (submitted < n || sofar().killsMidHandler < heldKills) {
         if (interrupt.aborted || Date.now() > lastBatchBy || submitted >= plan.length) return;
         if ((await unfinished(box.db)) >= RANDOM_BATCH) {
           await sleep(50);
@@ -313,13 +266,13 @@ async function randomKills(
   );
   const note =
     `${sup.killsMidHandler} of the ${sup.kills} kills caught a worker holding a withdrawal ` +
-    `(at least ${held} required)`;
+    `(at least ${heldKills} required)`;
   const check = () => {
     const problems: string[] = [];
     if (submitted < n) problems.push(`${submitted} withdrawals submitted, fewer than ${n}`);
-    if (sup.killsMidHandler < held) {
+    if (sup.killsMidHandler < heldKills) {
       problems.push(
-        `${sup.killsMidHandler} kills caught a worker holding a withdrawal, not ${held}`,
+        `${sup.killsMidHandler} kills caught a worker holding a withdrawal, not ${heldKills}`,
       );
     }
     return Promise.resolve(problems);
@@ -327,9 +280,31 @@ async function randomKills(
   return finish(run, c, sup, { settled: submitted, check, note });
 }
 
-// Every request COPIES times at once with one idempotency key, each copy on its own database
-// connection, and once more after the run: the withdrawals are the distinct keys. REFUSALS more
-// are refused by policy and must stay refused.
+const randomKillsScenario: Scenario = {
+  name: 'random_kills',
+  title: `random kills, ${RANDOM_WORKERS} workers`,
+  about:
+    `${RANDOM_WORKERS} workers at once, no crash point. Once each has run ` +
+    `${KILL_AFTER_MS / 1000} s past start-up, withdrawals are submitted ${RANDOM_BATCH} at a ` +
+    `time, each to its own fresh address, whenever fewer than ${RANDOM_BATCH} are unfinished, ` +
+    `until at least ${RANDOM_COUNT.full} were submitted and at least ` +
+    `${RANDOM_HELD_KILLS.full} kills caught a worker holding a withdrawal ` +
+    `(${RANDOM_COUNT.quick} and ${RANDOM_HELD_KILLS.quick} with --quick); then every ` +
+    `withdrawal must settle. From the first batch on, every ${KILL_EVERY_MS[0]} to ` +
+    `${KILL_EVERY_MS[1]} ms the supervisor picks a random worker that has run at least ` +
+    `${KILL_AFTER_MS / 1000} s past start-up, if there is one, SIGKILLs it and starts ` +
+    "another. A kill caught a worker holding a withdrawal when that withdrawal's lease is " +
+    "still in the dead worker's name. The minimum must be reached, and everything settled " +
+    `and graded, within ${RANDOM_BUDGET_MS.base / 1000} s + ` +
+    `${RANDOM_BUDGET_MS.perWithdrawal / 1000} s per withdrawal of the minimum count.`,
+  withdrawals: RANDOM_COUNT,
+  run: randomKills,
+};
+
+const COPIES = 5; // concurrent submissions of each request, one database connection each
+const REFUSALS = ['not_allowlisted', 'over_withdrawal_limit'] as const;
+
+// The withdrawals are the distinct keys.
 async function duplicateRequests(
   run: FaultRun,
   n: number,
@@ -401,19 +376,28 @@ async function duplicateRequests(
   return finish(run, c, sup, { settled: n, rejected: REFUSALS.length, check });
 }
 
-// Every attempt is dropped from the node's mempool; each must be sent again and settle.
+const duplicateRequestsScenario: Scenario = {
+  name: 'duplicate_requests',
+  title: 'duplicate requests',
+  about:
+    `every request is submitted ${COPIES} times at once with one idempotency key, over ` +
+    `${COPIES} database connections, and again after the run; ${REFUSALS.length} more are ` +
+    `refused by policy (${REFUSALS.join(', ')}) and must stay refused.`,
+  run: duplicateRequests,
+};
+
 async function droppedTx(run: FaultRun, n: number, interrupt: AbortSignal): Promise<Graded> {
   const { env, box } = run;
   const c = clock(budgetFor(n));
   await submitMany(run, n);
   const early: string[] = [];
-  const held = () => env.devnet.pendingFrom(box.hot.hotAddress);
+  const pooled = () => env.devnet.pendingFrom(box.hot.hotAddress);
   const sup = await faultAtBroadcast(run, c, interrupt, async () => {
     const attempts = await allAttempts(box.db);
-    const before = await held();
+    const before = await pooled();
     if (before !== attempts.length) early.push(`the node held ${before} of ${attempts.length}`);
     for (const txid of attempts) await env.devnet.dropFromMempool(txid);
-    const after = await held();
+    const after = await pooled();
     if (after !== 0) early.push(`the node still held ${after} transactions after the drops`);
   });
   const check = async () => {
@@ -423,24 +407,30 @@ async function droppedTx(run: FaultRun, n: number, interrupt: AbortSignal): Prom
   return finish(run, c, sup, { settled: n, check });
 }
 
-// One block, which the workers record at one confirmation (finality needs more); with no worker
-// running it is replaced by an empty one. A node that forgets the removed block's transactions
-// then holds none of the attempts, and each is sent again; one that puts them back in its mempool
-// holds all of them, and none is sent again. Workers run again, still without blocks, until each
-// withdrawal has recorded its block as reorganised out: with blocks, a transaction still in the
-// mempool could be mined again before a worker saw it out of a block, and record a move from one
-// block to another instead. Then each must settle on that same attempt (stuckAfterMs is long, so
-// no replacement).
+const droppedTxScenario: Scenario = {
+  name: 'dropped_tx',
+  title: 'dropped transaction',
+  about:
+    'no blocks until every withdrawal is broadcast; then, with the workers stopped, every ' +
+    "attempt is dropped from the node's mempool (it held all of them, and none after); then " +
+    'workers and blocks resume, and each withdrawal must be sent again and settle.',
+  run: droppedTx,
+};
+
+// With blocks while the workers watch for the reorg, a transaction still in the mempool could be
+// mined again before a worker saw it out of a block, and record a move from one block to another
+// instead; so they run without blocks until each has recorded it. stuckAfterMs is long, so no
+// replacement.
 async function reorg(run: FaultRun, n: number, interrupt: AbortSignal): Promise<Graded> {
   const { env, box } = run;
   const c = clock(budgetFor(n));
   await submitMany(run, n);
-  const recorded = async () =>
+  const allSeenInABlock = async () =>
     (await count(box.db`
       select count(*)::int as n from withdrawals w
        where not exists (select 1 from tx_attempts t
                           where t.withdrawal_id = w.id and t.seen_block is not null)`)) === 0;
-  const forgotten = async () =>
+  const allSeenBlocksCleared = async () =>
     (await count(
       box.db`select count(*)::int as n from tx_attempts where seen_block is not null`,
     )) === 0;
@@ -448,7 +438,7 @@ async function reorg(run: FaultRun, n: number, interrupt: AbortSignal): Promise<
   const sup = await faultAtBroadcast(run, c, interrupt, async (workUntil) => {
     await env.devnet.mine(1);
     const tip = await env.adapter.getTip();
-    if (!(await workUntil(recorded))) return;
+    if (!(await workUntil(allSeenInABlock))) return;
     if (!(await everyIs(box.db, 'BROADCAST')())) {
       early.push('a withdrawal settled before the reorg');
     }
@@ -466,7 +456,7 @@ async function reorg(run: FaultRun, n: number, interrupt: AbortSignal): Promise<
     const left = await env.devnet.pendingFrom(box.hot.hotAddress);
     const kept = env.reorgKeepsMempool ? attempts.length : 0;
     if (left !== kept) early.push(`the node held ${left} of ${attempts.length} after the reorg`);
-    await workUntil(forgotten);
+    await workUntil(allSeenBlocksCleared);
   });
   const check = async () => {
     const problems = [...early];
@@ -486,20 +476,29 @@ async function reorg(run: FaultRun, n: number, interrupt: AbortSignal): Promise<
   return finish(run, c, sup, { settled: n, check });
 }
 
-// As F3 in the pipeline suite: every first attempt is accepted and pending, then the fee level
-// rises, and the first block after it is mined before the workers resume. A node that evicts
-// what pays less (stuckEvicts) drops them all: each withdrawal's re-send of its first attempt must
-// be refused, and its replacement must record that. A node that holds them keeps them all,
-// unmined, and nothing is re-sent. Each withdrawal must settle on a replacement (attempt 2 or
-// later), not necessarily its last: on a slow machine attempt 3 can be stored before attempt 2
-// confirms, and is then refused.
+const reorgScenario: Scenario = {
+  name: 'reorg',
+  title: 'reorg before finality',
+  about:
+    'no blocks until every withdrawal is broadcast; then one block, which the workers record at ' +
+    'one confirmation; with the workers stopped, that block is replaced by an empty one and ' +
+    'the node reports no attempt confirmed. A node that forgets the removed transactions ' +
+    '(anvil) must then hold none of them, one that puts them back in its mempool (bitcoind) ' +
+    'all of them. Workers run again, still without blocks, until each withdrawal has recorded ' +
+    'its block as reorganised out (sending its attempt again where the node forgot it, and ' +
+    'only there); then workers and blocks resume, and each must settle on that same attempt.',
+  run: reorg,
+};
+
+// As F3 in the pipeline suite. A withdrawal may settle on any replacement, not necessarily its
+// last: on a slow machine attempt 3 can be stored before attempt 2 confirms, and is then refused.
 async function stuckFee(run: FaultRun, n: number, interrupt: AbortSignal): Promise<Graded> {
   const { env, box } = run;
   const c = clock(budgetFor(n));
   await submitMany(run, n);
   const after: WorkerOptions = { timings: { ...timings, stuckAfterMs: STALE_MS } };
   const early: string[] = [];
-  const held = () => env.devnet.pendingFrom(box.hot.hotAddress);
+  const pooled = () => env.devnet.pendingFrom(box.hot.hotAddress);
   let sup: Supervised;
   try {
     sup = await faultAtBroadcast(
@@ -508,11 +507,11 @@ async function stuckFee(run: FaultRun, n: number, interrupt: AbortSignal): Promi
       interrupt,
       async () => {
         const attempts = (await allAttempts(box.db)).length;
-        const before = await held();
+        const before = await pooled();
         if (before !== attempts) early.push(`the node held ${before} of ${attempts}`);
         await env.makeStuck();
         await env.devnet.mine(1);
-        const left = await held();
+        const left = await pooled();
         const expected = env.stuckEvicts ? 0 : before;
         if (left !== expected) early.push(`the node held ${left} after the first block`);
       },
@@ -545,6 +544,11 @@ async function stuckFee(run: FaultRun, n: number, interrupt: AbortSignal): Promi
       const what = env.stuckEvicts ? 'a refused re-send of it' : 'no refused re-send';
       problems.push(`${unlike} replacements of a first attempt did not record ${what}`);
     }
+    // a node that kept every attempt has each of them: none is sent again
+    if (!env.stuckEvicts) {
+      const resent = await withEvent(box.db, 'rebroadcast');
+      if (resent > 0) problems.push(`${resent} withdrawals sent an attempt again`);
+    }
     const other = await notSettledOn(box.db, 2, timings.maxAttempts);
     if (other > 0) problems.push(`${other} withdrawals did not settle on a replacement`);
     for (const txid of await firstAttempts(box.db)) {
@@ -553,94 +557,30 @@ async function stuckFee(run: FaultRun, n: number, interrupt: AbortSignal): Promi
     }
     return problems;
   };
-  return finish(run, c, sup, { settled: n, check });
+  return finish(run, c, sup, { settled: n, check, note: env.stuckNote });
 }
 
-const where: Record<CrashPoint, string> = {
-  after_reserve: 'after the reservation (nonce or coins) and fee are committed, before signing',
-  after_sign: 'after signing in memory, before the attempt is stored',
-  after_store: 'after the signed attempt is committed, before it is sent',
-  before_broadcast: 'after the node said it does not have the transaction, just before the send',
-  after_broadcast: 'after the node accepted the transaction, before the broadcast is recorded',
-  after_broadcast_recorded: 'right after the broadcast is recorded',
-  before_settle: 'after the transaction is seen final, before the settlement is posted',
-  after_settle: 'right after the settlement is committed',
-  after_replacement_store:
-    'after a replacement is stored, before it is sent; blocks wait until every withdrawal has ' +
-    `one (an attempt is stale after ${STALE_MS / 1000} s)`,
+const stuckFeeScenario: Scenario = {
+  name: 'stuck_fee',
+  title: 'stuck fee',
+  about:
+    'no blocks until every withdrawal is broadcast, each first attempt accepted by the node; ' +
+    'then, with the workers stopped, the harness raises the fee level blocks take from the next ' +
+    'block on (how, on each chain, is in its note) and one block is mined. A node that evicts ' +
+    'what pays less (anvil) then holds none of the first attempts, and each withdrawal must ' +
+    'find its first attempt gone and have the re-send of it refused; a node that keeps it ' +
+    'waiting (bitcoind) still holds all of them, and no attempt may be sent again. Then ' +
+    'workers and blocks resume. Each withdrawal must replace its first attempt (an attempt is ' +
+    `stale after ${STALE_MS / 1000} s); no first attempt may confirm, and each withdrawal must ` +
+    'settle on a replacement.',
+  run: stuckFee,
 };
 
 export const scenarios: Scenario[] = [
-  ...crashPoints.map((point): Scenario => ({
-    name: point,
-    title: `kill at ${point}`,
-    about: `killed ${where[point]}.`,
-    run: (run, n, interrupt) => killAt(run, point, n, interrupt),
-  })),
-  {
-    name: 'random_kills',
-    title: `random kills, ${RANDOM_WORKERS} workers`,
-    about:
-      `${RANDOM_WORKERS} workers at once, no crash point. Once each has run ` +
-      `${KILL_AFTER_MS / 1000} s past start-up, withdrawals are submitted ${RANDOM_BATCH} at a ` +
-      `time, each to its own fresh address, whenever fewer than ${RANDOM_BATCH} are unfinished, ` +
-      `until at least ${RANDOM_COUNT.full} were submitted and at least ` +
-      `${RANDOM_HELD_KILLS.full} kills caught a worker holding a withdrawal ` +
-      `(${RANDOM_COUNT.quick} and ${RANDOM_HELD_KILLS.quick} with --quick); then every ` +
-      `withdrawal must settle. From the first batch on, every ${KILL_EVERY_MS[0]} to ` +
-      `${KILL_EVERY_MS[1]} ms the supervisor picks a random worker that has run at least ` +
-      `${KILL_AFTER_MS / 1000} s past start-up, if there is one, SIGKILLs it and starts ` +
-      "another. A kill caught a worker holding a withdrawal when that withdrawal's lease is " +
-      "still in the dead worker's name. The minimum must be reached, and everything settled " +
-      `and graded, within ${RANDOM_BUDGET_MS.base / 1000} s + ` +
-      `${RANDOM_BUDGET_MS.perWithdrawal / 1000} s per withdrawal of the minimum count.`,
-    withdrawals: RANDOM_COUNT,
-    run: randomKills,
-  },
-  {
-    name: 'duplicate_requests',
-    title: 'duplicate requests',
-    about:
-      `every request is submitted ${COPIES} times at once with one idempotency key, over ` +
-      `${COPIES} database connections, and again after the run; ${REFUSALS.length} more are ` +
-      `refused by policy (${REFUSALS.join(', ')}) and must stay refused.`,
-    run: duplicateRequests,
-  },
-  {
-    name: 'dropped_tx',
-    title: 'dropped transaction',
-    about:
-      'no blocks until every withdrawal is broadcast; then, with the workers stopped, every ' +
-      "attempt is dropped from the node's mempool (it held all of them, and none after); then " +
-      'workers and blocks resume, and each withdrawal must be sent again and settle.',
-    run: droppedTx,
-  },
-  {
-    name: 'reorg',
-    title: 'reorg before finality',
-    about:
-      'no blocks until every withdrawal is broadcast; then one block, which the workers record at ' +
-      'one confirmation; with the workers stopped, that block is replaced by an empty one and ' +
-      'the node reports no attempt confirmed. A node that forgets the removed transactions ' +
-      '(anvil) must then hold none of them, one that puts them back in its mempool (bitcoind) ' +
-      'all of them. Workers run again, still without blocks, until each withdrawal has recorded ' +
-      'its block as reorganised out (sending its attempt again where the node forgot it, and ' +
-      'only there); then workers and blocks resume, and each must settle on that same attempt.',
-    run: reorg,
-  },
-  {
-    name: 'stuck_fee',
-    title: 'stuck fee',
-    about:
-      'no blocks until every withdrawal is broadcast, each first attempt accepted by the node; ' +
-      'then, with the workers stopped, the fee level is raised from the next block on and one ' +
-      'block is mined. A node that evicts what pays less (anvil) then holds none of the first ' +
-      'attempts, and each withdrawal must find its first attempt gone and have the re-send of ' +
-      'it refused; a node that keeps it waiting (bitcoind, whose blocks then take only ' +
-      'transactions paying at least 1 sat/vB over the normal rate) still holds all of them, ' +
-      'and nothing is sent again. Then workers and blocks resume. Each withdrawal must replace ' +
-      `its first attempt (an attempt is stale after ${STALE_MS / 1000} s); no first attempt may ` +
-      'confirm, and each withdrawal must settle on a replacement.',
-    run: stuckFee,
-  },
+  ...killScenarios,
+  randomKillsScenario,
+  duplicateRequestsScenario,
+  droppedTxScenario,
+  reorgScenario,
+  stuckFeeScenario,
 ];

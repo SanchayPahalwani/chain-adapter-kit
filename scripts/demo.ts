@@ -128,8 +128,10 @@ try {
   ];
   console.log(`   alice is credited ${units(10n * unit)} (1 unit = ${unit} base units of native)`);
   console.log(`   three destinations on alice's allowlist: ${dests.map(short).join(', ')}`);
+  const { approvalThreshold, approvalsRequired, approvers } = policy;
   console.log(
-    `   policy: ${units(policy.approvalThreshold)} or more needs 2 approvals (ops-1, ops-2)\n`,
+    `   policy: ${units(approvalThreshold)} or more needs ${approvalsRequired} approvals ` +
+      `(${approvers.join(', ')})\n`,
   );
 
   console.log(`2. A small withdrawal: ${units(unit)} to ${short(dests[0])}`);
@@ -141,7 +143,7 @@ try {
   console.log(`\n3. A withdrawal over the approval threshold: ${units(6n * unit)}`);
   const big = await submitWithdrawal(box.db, requests, request(6n * unit, dests[1]));
   console.log(`   ${big.state}`);
-  for (const approverId of ['ops-1', 'ops-2']) {
+  for (const approverId of policy.approvers.slice(0, policy.approvalsRequired)) {
     const w = await decideApproval(box.db, requests, {
       withdrawalId: big.id,
       approverId,

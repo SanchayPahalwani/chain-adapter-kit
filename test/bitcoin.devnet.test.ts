@@ -116,6 +116,17 @@ describe('bitcoin devnet', () => {
     expect(btcToSats(found[0]!.amount)).toBe(123_457n);
   });
 
+  it('D2b fundMany pays each amount as a confirmed coin of its own, in one transaction and one block', async () => {
+    const { address } = await newKey();
+    const before = await height();
+    const amounts = [10_000n, 20_000n, 20_000n, 30_001n];
+    await devnet.fundMany(address, amounts);
+    expect(await height()).toBe(before + 1);
+    const found = await coins(address);
+    expect(found.map((c) => btcToSats(c.amount)).sort((a, b) => Number(a - b))).toEqual(amounts);
+    expect(new Set(found.map((c) => c.txid)).size).toBe(1);
+  });
+
   it('D3 mine advances the height by n, twice in a row after an invalidateblock', async () => {
     const before = await height();
     await devnet.mine(2);

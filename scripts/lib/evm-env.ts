@@ -2,9 +2,9 @@ import { createPublicClient, http } from 'viem';
 import { createEvmAdapter } from '../../src/adapters/evm/adapter.js';
 import { createEvmDevnet } from '../../src/adapters/evm/devnet.js';
 import type { Devnet } from '../../src/conformance/harness.js';
-import { config } from '../../src/config.js';
+import { config, defaults } from '../../src/config.js';
 import { LocalSigner } from '../../src/core/local-signer.js';
-import type { PipelineEnv } from './env.js';
+import { nodeOverride, type PipelineEnv } from './env.js';
 
 const STUCK_BASE_FEE = 100n * 10n ** 9n; // 100 gwei
 const NORMAL_BASE_FEE = 10n ** 9n; // 1 gwei
@@ -41,6 +41,7 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     adapter,
     devnet,
     nodeVersion: await node.request({ method: 'web3_clientVersion' }),
+    nodeOverride: nodeOverride('EVM_RPC_URL', config.evmRpcUrl, defaults.evmRpcUrl),
     assets: ['native', token],
     unit: (asset) => (asset === 'native' ? 10n ** 16n : 1000n),
     freshAddress: async () =>
@@ -52,6 +53,9 @@ export async function makeEvmEnv(): Promise<PipelineEnv> {
     },
     fundingPieces: 1, // a nonce, not coins: one balance pays any number of withdrawals
     stuckEvicts: true, // anvil drops a transaction priced below a mined block's base fee
+    stuckNote:
+      `the harness sets anvil's base fee to ${STUCK_BASE_FEE / 10n ** 9n} gwei before every ` +
+      `block (normally ${NORMAL_BASE_FEE / 10n ** 9n} gwei)`,
     reorgKeepsMempool: false, // anvil_reorg drops the removed blocks' transactions
     async makeStuck() {
       stuck = true;

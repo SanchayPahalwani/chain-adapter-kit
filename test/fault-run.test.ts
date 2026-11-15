@@ -10,9 +10,11 @@ import { startMiner } from '../src/conformance/harness.js';
 import type { Db } from '../src/pipeline/db.js';
 import { getWithdrawal } from '../src/pipeline/requests.js';
 import { verifyAgainstChain } from '../src/pipeline/verify.js';
+import { grade } from '../scripts/lib/grading.js';
 import type { PipelineEnv } from '../scripts/lib/env.js';
 import { makeEvmEnv } from '../scripts/lib/evm-env.js';
-import { table, type Outcome } from '../scripts/lib/results.js';
+import { table, totalsOf, type Outcome } from '../scripts/lib/results.js';
+import { parseRunArgs, UsageError } from '../scripts/lib/run-args.js';
 import { openSandbox, type Sandbox } from '../scripts/lib/sandbox.js';
 import {
   spawnWorker,
@@ -22,6 +24,7 @@ import {
   type Supervised,
   type WorkerOptions,
 } from '../scripts/lib/supervisor.js';
+import { mining } from '../scripts/lib/waits.js';
 import { drive, eventsOf, openPipeline } from './pipeline-suite.js';
 
 // Each test spawns real worker processes (node --import tsx), so each gets its own timeout.
@@ -86,7 +89,11 @@ describe('fault run', () => {
     const injected = await crashEvents(box.db);
     expect(injected.map((e) => e.point)).toEqual(['after_broadcast', 'after_broadcast']);
     expect(new Set(injected.map((e) => e.withdrawal_id))).toEqual(new Set(ws.map((w) => w.id)));
-    expect(await verifyAgainstChain(box.db, box.chains)).toEqual({
+    // graded as the fault run grades: more blocks, and nothing left pending from the hot wallet
+    const { left, verdict, report } = await grade(env, box);
+    expect(left).toBe(0);
+    expect(report.ok).toBe(true);
+    expect(verdict).toEqual({
       withdrawals: 2,
       settled: 2,
       rejected: 0,
@@ -174,11 +181,10 @@ describe('fault run', () => {
       } finally {
         await stopMiner();
       }
-      expect(await verifyAgainstChain(box.db, box.chains)).toMatchObject({
-        settled: 2,
-        sentTwice: 0,
-        lost: 0,
-      });
+      const { left, verdict, report } = await grade(env, box);
+      expect(left).toBe(0);
+      expect(report.ok).toBe(true);
+      expect(verdict).toMatchObject({ settled: 2, sentTwice: 0, lost: 0, unfinished: 0 });
     },
   );
 
@@ -315,6 +321,36 @@ describe('fault-run script', () => {
     },
   );
 
+  it('X6b the total row covers every chain in the table', () => {
+    const verdict = {
+      withdrawals: 2,
+      settled: 2,
+      rejected: 0,
+      failed: 0,
+      sentTwice: 0,
+      lost: 0,
+      unfinished: 0,
+    };
+    const graded = { kills: 1, killsMidHandler: 0, verdict, drift: 0n, problems: [] };
+    const outcomes: Outcome[] = ['evm-anvil', 'bitcoin-regtest'].map((chain) => ({
+      chain,
+      name: 'reorg',
+      title: 'reorg before finality',
+      about: '',
+      graded,
+    }));
+    const total = table(outcomes, totalsOf([graded, graded]))
+      .trimEnd()
+      .split('\n')
+      .at(-1);
+    expect(total).toMatch(
+      /^\| \*\*Total\*\* +\| every scenario on evm-anvil and bitcoin-regtest +\| +4 \| +2 \| +4 \|/,
+    );
+    expect(table(outcomes.slice(0, 1), totalsOf([graded]))).toMatch(
+      /every scenario on evm-anvil +\|/,
+    );
+  });
+
   it('X6 the table has a chain column, and a scenario a chain cannot produce reads not applicable', () => {
     const verdict = {
       withdrawals: 2,
@@ -348,5 +384,67 @@ describe('fault-run script', () => {
       '| other-chain | reorg before finality (not applicable) |           - |            - |       - |        - |          - |    - |          - |            - |',
       '',
     ]);
+  });
+});
+
+describe('fault-run command line', () => {
+  const known = { chains: ['evm-anvil', 'bitcoin-regtest'], scenarios: ['reorg', 'stuck_fee'] };
+
+  it('X7 only the whole matrix on every chain at default counts may write docs/results.md', () => {
+    expect(parseRunArgs([], known)).toMatchObject({ chains: known.chains, n: 10, partial: false });
+    expect(parseRunArgs(['--chain', 'all'], known)).toMatchObject({ partial: false });
+    expect(parseRunArgs(['--no-write'], known)).toMatchObject({ partial: false, noWrite: true });
+    // a chain named, even one of all of them, is a partial run
+    for (const chain of known.chains) {
+      expect(parseRunArgs(['--chain', chain], known)).toMatchObject({
+        chains: [chain],
+        partial: true,
+      });
+    }
+    for (const argv of [['--quick'], ['--only', 'reorg'], ['--per-scenario', '10']]) {
+      expect(parseRunArgs(argv, known), argv.join(' ')).toMatchObject({ partial: true });
+    }
+  });
+
+  it('X8 an unknown --chain is a usage error: the script prints it with its usage and exits 2', async () => {
+    expect(() => parseRunArgs(['--chain', 'solana'], known)).toThrow(
+      new UsageError('unknown chain solana (known: evm-anvil, bitcoin-regtest, all)'),
+    );
+    expect(() => parseRunArgs(['--chians', 'all'], known)).toThrow(UsageError);
+    const root = fileURLToPath(new URL('../', import.meta.url));
+    const child = spawn('npx', ['tsx', 'scripts/fault-run.ts', '--chain', 'solana'], {
+      cwd: root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    const [code] = (await once(child, 'exit')) as [number | null];
+    expect(code, stderr).toBe(2);
+    expect(stderr).toMatch(
+      /^unknown chain solana \(known: evm-anvil, bitcoin-regtest, all\)\nusage: /,
+    );
+  });
+
+  it('X9 mining() keeps the error of the work when stopping the miner fails too', async () => {
+    const work = new Error('the supervisor failed');
+    const miner = new Error('the miner failed');
+    await expect(
+      mining(
+        () => Promise.reject(miner),
+        () => Promise.reject(work),
+      ),
+    ).rejects.toBe(work);
+    await expect(
+      mining(
+        () => Promise.reject(miner),
+        () => Promise.resolve(1),
+      ),
+    ).rejects.toBe(miner);
+    await expect(
+      mining(
+        () => Promise.resolve(),
+        () => Promise.resolve(1),
+      ),
+    ).resolves.toBe(1);
   });
 });

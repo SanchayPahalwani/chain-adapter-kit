@@ -3,7 +3,8 @@
 // (spec section 11). One line per scenario and chain, then the table. docs/results.md is written
 // only by the full matrix at default counts (every chain; no --chain, --quick, --only or
 // --per-scenario), only when every scenario passed, and only if the checkout did not change during
-// the run. Exit code 1 if any failed or the file could not be written, 130 if interrupted.
+// the run. Exit code 1 if any failed or the file could not be written, 2 for a bad command line,
+// 130 if interrupted.
 //
 //   npx tsx scripts/fault-run.ts [--chain <name> | all] [--quick | --per-scenario <n>]
 //                                [--only <name>,...] [--keep] [--json] [--no-write]
@@ -11,19 +12,22 @@
 // --chain: evm-anvil or bitcoin-regtest (default all: both, in that order); each chain's node is
 // the one its tests use (EVM_RPC_URL, BITCOIN_RPC_URL). --quick: 2 withdrawals per scenario
 // (default 10); random_kills submits at least 40 and until 3 kills caught a worker holding one
-// (default 100 and 20). --only: scenario names: a crash point, random_kills, duplicate_requests,
-// dropped_tx, reorg, stuck_fee. --keep: keep each scenario's schema and log. --json: the results
-// as one JSON document on stdout, and nothing else there. --no-write: leave docs/results.md as it
-// is (as any partial run does).
+// (default 100 and 20). --per-scenario: n withdrawals per scenario, except random_kills, which
+// keeps its own counts (the default ones, or those of --quick). On Bitcoin, dropped_tx, reorg and
+// stuck_fee hold a coin for every withdrawal at once, and a sandbox has 2 x fundingPieces coins
+// (48: the gas float's and the user's deposit), so above about 48 they time out. --only: scenario
+// names: a crash point, random_kills, duplicate_requests, dropped_tx, reorg, stuck_fee. --keep:
+// keep each scenario's schema and log. --json: the results as one JSON document on stdout, and
+// nothing else there. --no-write: leave docs/results.md as it is (as any partial run does).
 import { closeSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs } from 'node:util';
 import { config } from '../src/config.js';
 import { connect } from '../src/pipeline/db.js';
 import { makeBitcoinEnv } from './lib/bitcoin-env.js';
 import type { PipelineEnv } from './lib/env.js';
 import { makeEvmEnv } from './lib/evm-env.js';
+import type { Graded } from './lib/grading.js';
 import {
   checkoutOf,
   RESULTS_PATH,
@@ -33,7 +37,8 @@ import {
   type Outcome,
   type Totals,
 } from './lib/results.js';
-import { scenarios, setup, type Graded, type Scenario } from './lib/scenarios.js';
+import { parseRunArgs, UsageError, type RunArgs } from './lib/run-args.js';
+import { scenarios, setup, type Scenario } from './lib/scenarios.js';
 import { seconds } from './lib/waits.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -48,39 +53,23 @@ function usage(message: string): never {
   console.error(message);
   console.error(
     'usage: fault-run.ts [--chain <name> | all] [--quick | --per-scenario <n>] [--only <name>,...] ' +
-      '[--keep] [--json] [--no-write]',
+      '[--keep] [--json] [--no-write]\n' +
+      '  --per-scenario does not change random_kills; on Bitcoin, dropped_tx, reorg and stuck_fee ' +
+      'need a coin per withdrawal and a sandbox has 48, so above about 48 they time out',
   );
   process.exit(2);
 }
 
-const { values: args } = parseArgs({
-  options: {
-    chain: { type: 'string', default: 'all' },
-    quick: { type: 'boolean', default: false },
-    'per-scenario': { type: 'string' },
-    only: { type: 'string' },
-    keep: { type: 'boolean', default: false },
-    json: { type: 'boolean', default: false },
-    'no-write': { type: 'boolean', default: false },
-  },
-});
-if (args.quick && args['per-scenario'] !== undefined) usage('--quick or --per-scenario, not both');
-const chains = args.chain === 'all' ? Object.keys(envs) : [args.chain];
-for (const chain of chains) {
-  if (!Object.hasOwn(envs, chain)) {
-    usage(`unknown chain ${chain} (known: ${Object.keys(envs).join(', ')}, all)`);
-  }
+let args: RunArgs;
+try {
+  const known = { chains: Object.keys(envs), scenarios: scenarios.map((s) => s.name) };
+  args = parseRunArgs(process.argv.slice(2), known);
+} catch (error) {
+  if (error instanceof UsageError) usage(error.message);
+  throw error;
 }
-const n = args.quick ? 2 : Number(args['per-scenario'] ?? 10);
-if (!Number.isInteger(n) || n < 1) usage(`--per-scenario must be a positive integer`);
-const only = args.only?.split(',').map((s) => s.trim());
-for (const name of only ?? []) {
-  if (!scenarios.some((s) => s.name === name)) usage(`unknown scenario ${name}`);
-}
+const { chains, n, only, partial } = args;
 const selected = only ? scenarios.filter((s) => only.includes(s.name)) : scenarios;
-// docs/results.md describes the whole matrix on every chain at its default counts, and nothing else
-const partial =
-  args.chain !== 'all' || args.quick || only !== undefined || args['per-scenario'] !== undefined;
 // with --json, stdout carries the JSON document only
 const say = args.json ? console.error : console.log;
 
@@ -105,12 +94,13 @@ process.on('SIGTERM', onSignal);
 
 const started = Date.now();
 // only a run that can write docs/results.md needs to know which code it ran
-const checkout = args['no-write'] || partial ? undefined : checkoutOf(root);
+const checkout = args.noWrite || partial ? undefined : checkoutOf(root);
 const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 const made: PipelineEnv[] = [];
 for (const chain of chains) made.push(await envs[chain]!());
 const nodes = made.map((e) => `${e.chain} (${e.nodeVersion})`).join(', ');
-say(`fault run on ${nodes}`);
+const overrides = made.flatMap((e) => (e.nodeOverride ? [e.nodeOverride] : []));
+say(`fault run on ${nodes}${overrides.length > 0 ? `; ${overrides.join(', ')}` : ''}`);
 
 // the chain, padded to the longest name, then the scenario
 const width = Math.max(...chains.map((c) => c.length));
@@ -231,11 +221,11 @@ async function report() {
   }
 
   if (failures > 0) {
-    if (!args['no-write']) console.error(`${RESULTS_PATH} not written: the run failed`);
+    if (!args.noWrite) console.error(`${RESULTS_PATH} not written: the run failed`);
     process.exitCode = 1;
     return;
   }
-  if (args['no-write'] || !totals) return;
+  if (args.noWrite || !totals) return;
   if (partial || !checkout) {
     console.error(`${RESULTS_PATH} not written: only the full matrix at default counts writes it`);
     return;
@@ -265,6 +255,7 @@ async function report() {
     commit: checkout.commit,
     date,
     chains: nodes,
+    overrides,
     postgres,
     node: process.version,
     command: ['npx tsx', script, ...process.argv.slice(2)].join(' '),

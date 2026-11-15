@@ -1,5 +1,6 @@
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { p2wpkh } from '@scure/btc-signer';
+import { Transaction, p2wpkh } from '@scure/btc-signer';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import type { AssetId } from '../../core/adapter.js';
 import type { Devnet } from '../../conformance/harness.js';
 import { REGTEST } from './adapter.js';
@@ -12,6 +13,8 @@ const EXPIRY_HOURS = 336; // bitcoind's default -mempoolexpiry
 
 export interface BitcoinDevnet extends Devnet {
   rpc: BitcoinRpc;
+  // Pays each amount to `address` as a coin of its own, all in one transaction, and mines it.
+  fundMany(address: string, amounts: bigint[]): Promise<void>;
   // Mines `blocks` blocks that hold only the mempool transactions paying at least `satPerVb` by
   // the node's BIP-141 vsize (and only once their mempool parents are in); the rest stay pending.
   mineAtLeast(blocks: number, satPerVb: bigint): Promise<void>;
@@ -86,6 +89,26 @@ export async function createBitcoinDevnet(
     async fund(address: string, asset: AssetId, amount: bigint) {
       if (asset !== 'native') throw new Error(`bitcoin has no asset "${asset}"`);
       await pay(address, satsToBtc(amount));
+      await mine(1);
+    },
+
+    // sendmany takes an address-to-amount map, and send and createrawtransaction refuse an
+    // address twice, so the outputs are built here and the funder adds inputs and change.
+    // Not safe to call concurrently with itself or with fund, for the same reason as fund.
+    async fundMany(address: string, amounts: bigint[]) {
+      const tx = new Transaction({ version: 2, lockTime: 0 });
+      for (const amount of amounts) tx.addOutputAddress(address, amount, REGTEST);
+      const options = { fee_rate: FEE_RATE, replaceable: true };
+      const funded = await funder<{ hex: string }>('fundrawtransaction', [
+        bytesToHex(tx.unsignedTx),
+        options,
+      ]);
+      const signed = await funder<{ hex: string; complete: boolean }>(
+        'signrawtransactionwithwallet',
+        [funded.hex],
+      );
+      if (!signed.complete) throw new Error('the funder could not sign its payment');
+      await rpc.call('sendrawtransaction', [signed.hex]);
       await mine(1);
     },
 

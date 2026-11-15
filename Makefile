@@ -1,4 +1,4 @@
-.PHONY: up down test typecheck lint migrate conformance faults demo reconcile contracts
+.PHONY: up down test typecheck lint migrate conformance faults demo reconcile chain-cost contracts
 
 node_modules: package-lock.json
 	npm ci
@@ -41,6 +41,12 @@ demo: node_modules up
 # has the tables this one reads.
 reconcile: node_modules migrate
 	npx tsx scripts/reconcile.ts
+
+# What adding Bitcoin took, from git (docs/adding-a-chain.md): the milestone-4 commits, without
+# the fault-run fixes that landed between them (ee6d484, 428ceae) or the later hardening.
+BITCOIN_COMMITS = dfc12c8 df96c74 a4e163c 14f50c3 4361425 c6fcb73 10ef314
+chain-cost: node_modules
+	npx tsx scripts/chain-cost.ts src/adapters/bitcoin $(BITCOIN_COMMITS)
 
 # Compiles contracts/TestToken.sol with forge inside the Foundry image (solc version from the
 # file's pragma; forge downloads it on first use) and writes only its ABI and bytecode.

@@ -1,8 +1,11 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -14,4 +17,23 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
-      - run: npx tsx scripts/fault-run.ts --quick --no-write
+        timeout-minutes: 20
+      # The whole quick matrix. It runs random_kills and duplicate_requests too, so npm test skips
+      # X4 (test/fault-run.test.ts), which runs those two through this same script, when CI is
+      # set. --keep keeps every scenario's worker log, even one interrupted by the step timeout;
+      # each finished scenario's line names its log, and TMPDIR puts them all where the upload
+      # below looks.
+      - run: npx tsx scripts/fault-run.ts --quick --no-write --keep
+        timeout-minutes: 12
+        env:
+          TMPDIR: ${{ runner.temp }}
+      - if: failure() || cancelled()
+        run: docker compose logs --no-color --timestamps > "$RUNNER_TEMP/compose.log" 2>&1
+      - if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs
+          path: |
+            ${{ runner.temp }}/compose.log
+            ${{ runner.temp }}/fault-run-*.log
+          if-no-files-found: ignore

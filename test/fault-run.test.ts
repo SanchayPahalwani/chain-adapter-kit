@@ -257,12 +257,14 @@ describe('fault run', () => {
   });
 });
 
-// The script end to end, on two scenarios and both chains: the whole quick matrix is a separate CI
-// step.
+// The script end to end, on two scenarios and both chains.
 describe('fault-run script', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
 
-  it(
+  // CI runs the whole quick matrix as a step of its own (.github/workflows/ci.yml), these two
+  // scenarios included, and that run fails on the same minimums; so in CI this test is skipped
+  // rather than run both scenarios twice.
+  it.skipIf(Boolean(process.env.CI))(
     'X4 the quick fault run exits 0 and reports zero sent twice, lost, unfinished and drift',
     // more than the two scenarios' own time limits on two chains together (2 x (140 s + 50 s)),
     // so a slow run fails with the script's reason

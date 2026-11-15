@@ -18,6 +18,7 @@ typecheck: node_modules
 lint: node_modules
 	npm run lint
 
+# The schema KIT_DB_SCHEMA names (it must exist), or the default one.
 migrate: node_modules
 	npx tsx scripts/migrate.ts
 
@@ -36,7 +37,8 @@ demo: node_modules up
 
 # Reconciles the ledger against the chain, configured by the environment (KIT_SEED, KIT_DB_SCHEMA,
 # KIT_CHAINS, DATABASE_URL and the chain's own variables), which make passes through. Migrates the
-# default schema first, which is the one it reads without KIT_DB_SCHEMA.
+# schema it reads first (KIT_DB_SCHEMA's, or the default one), so a schema an older version made
+# has the tables this one reads.
 reconcile: node_modules migrate
 	npx tsx scripts/reconcile.ts
 

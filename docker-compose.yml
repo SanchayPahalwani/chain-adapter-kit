@@ -1,5 +1,6 @@
 # Services are reached only from the host through published ports, so no project network is needed.
 services:
+  # Credentials kit/kit are test-only: a throwaway database, published on 127.0.0.1 only.
   postgres:
     image: postgres:17-alpine
     network_mode: bridge
@@ -33,6 +34,7 @@ services:
   bitcoind:
     build: docker/bitcoind
     image: chain-adapter-kit-bitcoind:32.1
+    pull_policy: build # a local image: never look for it in a registry
     network_mode: bridge
     command: >-
       -regtest -server -txindex=1 -fallbackfee=0.0002

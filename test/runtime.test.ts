@@ -1,6 +1,11 @@
+import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { config, defaults } from '../src/config.js';
+import { chainAssets } from '../src/chains.js';
+import { config, configFrom, defaults } from '../src/config.js';
+import { connect } from '../src/pipeline/db.js';
 import { buildRuntime, readRuntimeEnv } from '../src/pipeline/runtime.js';
 import { makeBitcoinEnv } from '../scripts/lib/bitcoin-env.js';
 import type { PipelineEnv } from '../scripts/lib/env.js';
@@ -21,6 +26,7 @@ describe('worker runtime from an environment', () => {
     [{ KIT_SEED, KIT_CRASH_AT: 'bogus' }, /KIT_CRASH_AT: unknown crash point bogus/],
     [{ KIT_SEED, KIT_LEASE_MS: '1.5' }, /KIT_LEASE_MS must be a positive integer, got 1.5/],
     [{ KIT_SEED, KIT_MAX_ATTEMPTS: '0' }, /KIT_MAX_ATTEMPTS must be a positive integer, got 0/],
+    [{ KIT_SEED, KIT_RETRY_BASE_MS: '-1' }, /KIT_RETRY_BASE_MS must be a positive integer, got -1/],
   ])('readRuntimeEnv(%j) throws %s', (env, message) => {
     expect(() => readRuntimeEnv(env)).toThrow(message);
   });
@@ -34,6 +40,39 @@ describe('worker runtime from an environment', () => {
     }
     expect(message).toMatch(/DATABASE_URL/);
     expect(message).not.toContain('secret');
+  });
+
+  it('reads KIT_RETRY_BASE_MS as it reads the other timings', () => {
+    expect(
+      readRuntimeEnv({ KIT_SEED, KIT_RETRY_BASE_MS: '250', KIT_LEASE_MS: '100' }),
+    ).toMatchObject({ timings: { retryBaseMs: 250, leaseMs: 100 } });
+  });
+
+  it('reads an empty variable as unset, everywhere', () => {
+    const blank = (names: string[]) => Object.fromEntries(names.map((name) => [name, '']));
+    const runtime = ['DATABASE_URL', 'KIT_DB_SCHEMA', 'KIT_CHAINS', 'KIT_CRASH_AT', 'KIT_LEASE_MS'];
+    const read = (env: Record<string, string>) => ({ ...readRuntimeEnv(env), chainEnv: {} });
+    expect(read({ KIT_SEED, ...blank([...runtime, 'KIT_RETRY_BASE_MS']) })).toEqual(
+      read({ KIT_SEED }),
+    );
+    expect(() => readRuntimeEnv({ KIT_SEED: '' })).toThrow(/KIT_SEED must be 64 hex/);
+    const services = ['DATABASE_URL', 'EVM_RPC_URL', 'BITCOIN_RPC_URL'];
+    expect(configFrom({})).toEqual(defaults);
+    expect(configFrom(blank([...services, 'BITCOIN_RPC_USER', 'BITCOIN_RPC_PASSWORD']))).toEqual(
+      defaults,
+    );
+    expect(chainAssets('evm-anvil', { KIT_EVM_TOKENS: '' })).toEqual(['native']);
+  });
+
+  it('serves token ids checksummed, whatever the case of KIT_EVM_TOKENS', () => {
+    const token = '0x52908400098527886E0F7030069857D2E4169EE7';
+    expect(chainAssets('evm-anvil', { KIT_EVM_TOKENS: token.toLowerCase() })).toEqual([
+      'native',
+      token,
+    ]);
+    expect(() => chainAssets('evm-anvil', { KIT_EVM_TOKENS: 'nope' })).toThrow(
+      'KIT_EVM_TOKENS: nope is not an address',
+    );
   });
 
   it('takes its defaults from the code, not from process.env', () => {
@@ -56,7 +95,7 @@ describe('worker runtime from an environment', () => {
     });
 
     it.each([
-      [{ KIT_EVM_TOKENS: 'nope' }, /KIT_EVM_TOKENS: nope is not a contract address/],
+      [{ KIT_EVM_TOKENS: 'nope' }, /KIT_EVM_TOKENS: nope is not an address/],
       [{ KIT_EVM_FINALITY_DEPTH: 'x' }, /KIT_EVM_FINALITY_DEPTH: bad depth x/],
       [{ EVM_RPC_URL: 'ftp://127.0.0.1' }, /EVM_RPC_URL: not an http URL: ftp:\/\/127.0.0.1/],
     ])('a bad chain variable %j throws %s', async (bad, message) => {
@@ -130,5 +169,53 @@ describe('worker runtime from an environment', () => {
         await deps.db.end();
       }
     });
+  });
+});
+
+describe('migrate script', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const admin = connect(config.databaseUrl);
+  const schema = `t_${randomBytes(6).toString('hex')}`;
+  afterAll(async () => {
+    try {
+      await admin`drop schema if exists ${admin(schema)} cascade`;
+    } finally {
+      await admin.end();
+    }
+  });
+
+  async function migrateScript(env: Record<string, string>) {
+    const child = spawn('npx', ['tsx', 'scripts/migrate.ts'], {
+      cwd: root,
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (chunk: Buffer) => (out += chunk.toString()));
+    child.stderr.on('data', (chunk: Buffer) => (out += chunk.toString()));
+    const [code] = (await once(child, 'exit')) as [number | null];
+    return { code, out };
+  }
+  const exists = async (name: string) => {
+    const [row] = await admin<
+      { found: boolean }[]
+    >`select to_regclass(${name}) is not null as found`;
+    return row?.found;
+  };
+
+  it('migrates the schema KIT_DB_SCHEMA names, and refuses one that does not exist', async () => {
+    expect(await migrateScript({ KIT_DB_SCHEMA: schema })).toEqual({
+      code: 1,
+      out: `schema ${schema} does not exist\n`,
+    });
+    expect(await exists(`${schema}.withdrawals`)).toBe(false);
+
+    await admin`create schema ${admin(schema)}`;
+    expect(await migrateScript({ KIT_DB_SCHEMA: schema })).toEqual({
+      code: 0,
+      out: `migrations applied to schema ${schema}\n`,
+    });
+    expect(await exists(`${schema}.withdrawals`)).toBe(true);
+    expect(await migrateScript({ KIT_DB_SCHEMA: 'Bad-Name' })).toMatchObject({ code: 2 });
   });
 });

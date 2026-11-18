@@ -454,7 +454,7 @@ transfer is explained (Q2).
 
 ## How the claim is tested
 
-`scripts/fault-run.ts` runs every scenario of spec section 11 on each chain in turn,
+`scripts/fault-run.ts` runs every scenario on each chain in turn,
 `evm-anvil` and then `bitcoin-regtest`, each in a fresh schema with a freshly funded hot
 wallet (`openSandbox`) and worker processes (`scripts/worker-main.ts`) under a supervisor
 (`scripts/lib/supervisor.ts`). The scenarios are in `scripts/lib/scenarios.ts`:
@@ -568,57 +568,3 @@ open (design call 10, `killOnce`, X3b).
 **What does reconciliation not prove?** It compares the ledger with the hot wallet, not
 with destinations; that is `verifyAgainstChain`. Its chain reads are not pinned to its
 database snapshot, so its own comment says to confirm a failure with a second run.
-
-## Where the code differs from the spec
-
-The spec in `docs/superpowers/specs/` was approved before the build and has since been
-brought in line with the code, each change marked "(decided during the build)". The
-changes, for a reader who knows the original:
-
-1. The fault run covers every scenario of spec section 11 on both chains (nine crash
-   points; random kills, until a minimum number caught a worker holding a withdrawal;
-   duplicates; dropped; reorg; stuck fee). It writes `docs/results.md` only for the full
-   default matrix on every chain, all passing, on a checkout that did not change.
-2. Grading waits for `finalityDepth + 1` more blocks and a node holding nothing more from
-   the hot wallet (`Devnet.pendingFrom`, C16). The hot wallet holds a token float. Each
-   scenario also checks that its own fault happened, and a scenario can declare itself
-   not applicable on a chain (none does yet).
-3. Lost is a `SETTLED` withdrawal whose destination holds less than its amount (the spec
-   said zero), non-terminal ones are unfinished, and sent twice also counts anything at a
-   `REJECTED` or `FAILED` destination.
-4. `reconcile(db, chains, assets)` reads the hot address only, explains only attempts of
-   `SIGNED` and `BROADCAST` withdrawals, adds `custody_covered` and
-   `one_confirmed_attempt`, and throws when asked to compare nothing.
-5. `settle` posts the fee before the amount.
-6. `track` stops replacing at `maxAttempts`, refuses to settle when two attempts confirm,
-   writes `reorg` and `reorged_out`, and writes `rebroadcast` only when the re-send was
-   accepted; the broadcast handler records only the latest attempt.
-7. `Devnet` has `pendingFrom` (C16) and the harness `unknownTxid()`. C13 funds its
-   wallet twice; Bitcoin needed no capability flag. C14's after-expiry form is not
-   written, and C14 skips for such a harness.
-8. Bitcoin: `@scure/btc-signer`; a node with `-txindex`; a fixed 2 sat/vB; dust refused at
-   the quote; change under 294 sat folded into the fee; replacements rebuilt from the
-   previous body and checked against the reservation and intent, at the highest of an
-   eighth more, 1 sat/vB more and the quote, and refused when no change is left; the
-   public key recovered from the signature; high S normalised; `scanBlock` reports
-   coinbase and change outputs too.
-9. `finalityDepth` defaults to 3; the tests, the fault run and the demo use 2. Each
-   `PipelineEnv` says how its node behaves (`fundingPieces`, `stuckEvicts`,
-   `reorgKeepsMempool`). On Bitcoin a stuck fee is the harness choosing what to mine.
-10. Layout: `src/chains.ts`, `src/config.ts`, `src/pipeline/runtime.ts`,
-    `src/pipeline/verify.ts`, `src/adapters/bitcoin/{adapter,devnet,rpc}.ts`,
-    `scripts/lib/*` (with `grading.ts`), `docker/bitcoind/`, `scripts/demo.ts` and
-    `scripts/reconcile.ts` exist; `src/core/json.ts` and `src/pipeline/config.ts` do not.
-11. The demo, on EVM only, also replays a request and refuses its key reused for another
-    amount, checks what it prints about the crash, the replay and the balances, and exits
-    1 if one claim does not hold.
-12. Make targets: `up` (building the bitcoind image), `down`, `test`, `typecheck`,
-    `lint`, `migrate`, `conformance`, `faults`, `demo`, `reconcile`, `chain-cost`,
-    `contracts`.
-13. From the final review: `claim` takes only chains the worker has a runtime for; the
-    24-hour limit leaves out `FAILED` as well as `REJECTED`; the EVM adapter normalises a
-    high S and ties every attempt to its sender; only approvers the policy currently
-    lists count toward M.
-14. A minimum amount per asset (`minAmount`, rejected as `below_minimum` before the
-    limits), so a Bitcoin withdrawal below the dust limit is refused at request instead of
-    waiting in `APPROVED` with its hold.

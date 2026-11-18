@@ -14,9 +14,9 @@ the seven commits of milestone 4: the regtest node and its devnet controls, then
 their review; the adapter's first part, then its fix; the second part, then its fix; and the
 pipeline and fault run on regtest.
 
-Two kinds of commit are left out. `ee6d484` and `428ceae` landed between those seven, but they
+Two kinds of commit are left out. `dd233ca` and `8a13435` landed between those seven, but they
 are fault-run fixes from the previous milestone, not Bitcoin work. The code commits after
-`10ef314` (from `ad1cadc` on) hardened both adapters and the pipeline after a review of the
+`3c93755` (from `bd2b124` on) hardened both adapters and the pipeline after a review of the
 whole repository; they are not part of the measurement, and
 [After the measurement](#after-the-measurement) says what they changed outside the adapters.
 
@@ -24,16 +24,16 @@ It needs the repository's history: in a shallow clone git cannot show these comm
 
 ```text
 $ make chain-cost
-npx tsx scripts/chain-cost.ts src/adapters/bitcoin dfc12c8 df96c74 a4e163c 14f50c3 4361425 c6fcb73 10ef314
+npx tsx scripts/chain-cost.ts src/adapters/bitcoin f5f2a8e 41d1d4e b8c255d 987a889 ba80f23 17c7dfb 3c93755
 Adapter directory: src/adapters/bitcoin/
 Commits: 7, by author time
-  dfc12c8  2026-11-12T14:37:57+05:30  feat(bitcoin): regtest node from the official release, RPC client, devnet controls
-  df96c74  2026-11-12T14:51:04+05:30  fix(bitcoin): test the drop's survivor logic, clearer RPC errors, no image volume
-  a4e163c  2026-11-12T15:04:19+05:30  feat(bitcoin): P2WPKH adapter with external signing, conformance C1-C10, C13, C16
-  14f50c3  2026-11-12T15:38:57+05:30  fix(bitcoin): cover multi-input transfers, fund C13 twice in the suite, startup checks
-  4361425  2026-11-12T15:57:02+05:30  feat(bitcoin): replace-by-fee, block scan; conformance C11-C15
-  c6fcb73  2026-11-12T16:14:00+05:30  fix(bitcoin): build replacements from the previous attempt and check them against the reservation
-  10ef314  2026-11-12T17:07:15+05:30  feat(bitcoin): pipeline and fault run on regtest
+  f5f2a8e  2026-11-12T14:37:57+05:30  feat(bitcoin): regtest node from the official release, RPC client, devnet controls
+  41d1d4e  2026-11-12T14:51:04+05:30  fix(bitcoin): test the drop's survivor logic, clearer RPC errors, no image volume
+  b8c255d  2026-11-12T15:04:19+05:30  feat(bitcoin): P2WPKH adapter with external signing, conformance C1-C10, C13, C16
+  987a889  2026-11-12T15:38:57+05:30  fix(bitcoin): cover multi-input transfers, fund C13 twice in the suite, startup checks
+  ba80f23  2026-11-12T15:57:02+05:30  feat(bitcoin): replace-by-fee, block scan; conformance C11-C15
+  17c7dfb  2026-11-12T16:14:00+05:30  fix(bitcoin): build replacements from the previous attempt and check them against the reservation
+  3c93755  2026-11-12T17:07:15+05:30  feat(bitcoin): pipeline and fault run on regtest
 
 Files outside src/adapters/bitcoin/, lines summed over the commits:
   category                   added  removed  file
@@ -71,8 +71,8 @@ Totals:
     infrastructure               5 files   +107 -2
     other                        0 files   +0 -0
 
-First commit: 2026-11-12T14:37:57+05:30 (dfc12c8)
-Last commit:  2026-11-12T17:07:15+05:30 (10ef314)
+First commit: 2026-11-12T14:37:57+05:30 (f5f2a8e)
+Last commit:  2026-11-12T17:07:15+05:30 (3c93755)
 Elapsed:      2 h 29 min 18 s, author time, first to last commit
 ```
 
@@ -84,7 +84,7 @@ What the numbers say:
 - `src/core/` and `src/pipeline/` did not change. The interface, the signer, the state
   machine, the ledger and the schema served a coin chain as they were: the coin table
   (`chain_coins` in `migrations/001_init.sql`) and the Postgres store that reserves coins
-  (`src/pipeline/input-store.ts`) were built with the EVM work, before Bitcoin (`41b1eef`).
+  (`src/pipeline/input-store.ts`) were built with the EVM work, before Bitcoin (`fa1e2fe`).
 - Outside the adapter, it took a registry entry and its configuration, one change to the
   conformance suite (C13 funds its wallet twice: a UTXO chain needs two coins for two
   concurrent reservations), and test-harness work. The node's container and one dependency
@@ -123,7 +123,7 @@ person's hours.
   signing, change below dust, replacements and the start-up checks.
 - `test/bitcoin.conformance.test.ts`: `runConformanceSuite` on regtest, with Bitcoin's harness:
   the addresses it must reject (other networks and other encodings of one key) and the
-  replacement form. Until `4361425` it also skipped C14 and C15, not yet written.
+  replacement form. Until `ba80f23` it also skipped C14 and C15, not yet written.
 - `test/bitcoin.pipeline.test.ts`: `runPipelineSuite` on Bitcoin, and a P4 variant that checks
   that twelve concurrent withdrawals reserved twelve disjoint coin sets and that each
   transaction spent exactly its own.
@@ -159,7 +159,7 @@ person's hours.
 - `test/pipeline-suite.ts`: F5 (an underfunded hot wallet delays a withdrawal and does not
   fail it) checked the state the withdrawal waits in, and that depends on the chain: on EVM it
   is signed and sent and the node refuses it; on Bitcoin no coin can be reserved and it stays
-  `APPROVED`. The check became "never terminal". A later commit (`881ed0d`) made the waiting
+  `APPROVED`. The check became "never terminal". A later commit (`42a8018`) made the waiting
   states a per-chain option, `underfundedWaitsIn`.
 
 **Infrastructure**
@@ -176,20 +176,20 @@ person's hours.
 
 ### After the measurement
 
-The code commits after `10ef314` came from a review of the whole repository and are not
+The code commits after `3c93755` came from a review of the whole repository and are not
 counted above. Outside the adapters:
 
-- `ad1cadc` changed comments only in `src/core/adapter.ts` and `src/core/signer.ts` (broadcast
+- `bd2b124` changed comments only in `src/core/adapter.ts` and `src/core/signer.ts` (broadcast
   decides `already_known` by lookup and throws on a transport failure; a signer may return
   either S form) and in `src/conformance/harness.ts` (what `pendingFrom` counts on a UTXO
   chain). It also added F7 to the pipeline suite.
-- `881ed0d` changed `src/pipeline/`. One of its fixes matters only once there is more than one
+- `42a8018` changed `src/pipeline/`. One of its fixes matters only once there is more than one
   chain: `claim` (`src/pipeline/worker.ts`) now takes only rows of the chains the worker has a
   runtime for, where before a worker could lease another chain's row, fail on it and back off.
   The others concern approvals, the 24-hour limit, error bookkeeping and reconciliation.
-- `62c1d4f` changed the fault run, among other things funding the Bitcoin hot wallet in one
-  payment. `3e6c182` changed CI, and how empty settings are read in `src/config.ts`,
-  `src/chains.ts` and `src/pipeline/runtime.ts`. `9c935ac`, an EVM fix, changed a comment in
+- `367974e` changed the fault run, among other things funding the Bitcoin hot wallet in one
+  payment. `f9e6c19` changed CI, and how empty settings are read in `src/config.ts`,
+  `src/chains.ts` and `src/pipeline/runtime.ts`. `cf5102c`, an EVM fix, changed a comment in
   `src/pipeline/worker.ts`.
 
 ## Conformance checks on Bitcoin

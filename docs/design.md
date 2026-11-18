@@ -205,7 +205,7 @@ cases fail the step before anything is stored (F7, on both chains).
 In the expiry model the risk moves to the replacement: signing a second transaction while
 the first can still be included is a double payment. So the adapter returns `null` until
 the first one's last valid round has passed, and the pipeline keeps polling (`replace`
-returns false). No expiry-model adapter exists yet; the spec moved from Solana, whose
+returns false). No expiry-model adapter exists yet; the planned third chain moved from Solana, whose
 local validator does not run on linux/arm64 from official artifacts, to Algorand (see
 section 12).
 

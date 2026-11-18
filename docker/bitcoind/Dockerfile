@@ -21,7 +21,8 @@ RUN set -eux; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     f="bitcoin-${BITCOIN_VERSION}-${triple}.tar.gz"; \
-    curl -fsSLO "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/${f}"; \
+    curl -fsSLO --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 20 \
+      "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/${f}"; \
     echo "${sha}  ${f}" | sha256sum -c -; \
     tar -xzf "${f}"; \
     install -m 0755 "bitcoin-${BITCOIN_VERSION}/bin/bitcoind" "bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli" /usr/local/bin/

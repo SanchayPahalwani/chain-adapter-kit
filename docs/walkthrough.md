@@ -95,7 +95,7 @@ the approver set get `NotAnApprover` (R13). One `approvals` row per approver; th
 posts `release:<id>` and moves to `REJECTED`; an approve recounts and moves to `APPROVED`
 at M distinct approvers, counting only those the policy lists now, so one removed after
 approving no longer counts (R11, R17, R17b). A reject vetoes even from an approver who
-approved earlier (R16, design call 21): a veto must never be dropped silently, and every
+approved earlier (R16): a veto must never be dropped silently, and every
 held withdrawal needs a way out inside the system. The row lock orders an approve that
 races a reject, so the withdrawal ends in one consistent state (R21b).
 
@@ -243,8 +243,8 @@ Why this order:
 - **Ask the chain before sending.** The one dangerous kill is between the send and the
   record. Asking first turns the re-run into a record with no send. The EVM adapter's
   `broadcast` also looks the txid up first (`nodeHas`), and after an error it tells
-  `already_known` from `rejected` by looking the txid up again, never by the error text
-  (design call 22). The handler does not depend on that.
+  `already_known` from `rejected` by looking the txid up again, never by the error text.
+  The handler does not depend on that.
 - **Record after sending.** The event holds the node's answer, which exists only after
   the call. A transport error throws and leaves `SIGNED` for a retry (P6). `rejected` is
   not final under the adapter contract, so it is recorded and tracking takes over.
@@ -319,12 +319,12 @@ Why this order:
 **Replacement.** `replace` calls `buildReplacement` with the stored reservation and the
 previous attempt's unsigned body and fee. On EVM that is the same body, so the same nonce
 and the same `from`, with both fee fields raised by at least one eighth and at least to
-the current market quote (`bumped`, design call 24). It refuses a sender (in the intent
+the current market quote (`bumped`). It refuses a sender (in the intent
 or the reservation) or a nonce other than the previous body's, so a replacement always
 conflicts with what it replaces. It signs, then in one transaction: `transition` from
 `BROADCAST` back to `SIGNED` first, `storeAttempt` with the next `attempt_no`, and a
 `replacement` event. The `broadcast` handler then sends it exactly as it sends a first
-attempt (design call 4: one send path, one recovery path).
+attempt (one send path, one recovery path).
 
 - `after_replacement_store`. Durable: `SIGNED`, attempt N+1 stored and unsent; attempt N
   may still be pending, or evicted. The next worker's `broadcast` takes the latest
@@ -368,7 +368,7 @@ three attempts, keeps polling, and still settles exactly one.
 
 **Reverted (F4).** The test makes `getTxStatus` report every confirmation as reverted.
 `settle` takes the `FAILED` branch: the fee is posted, since the gas was spent, and
-`release:<id>` returns the amount to the user. `FAILED` is terminal (design call 18). A
+`release:<id>` returns the amount to the user. `FAILED` is terminal. A
 real revert is in `test/evm.pipeline.test.ts`: the tokens are burnt after `RESERVED`, so
 the stored token transfer reverts when mined.
 
@@ -419,7 +419,7 @@ A count of zero throws `LostRace` and rolls the transition back. Without the che
 
 No step trusts the lease. Safety comes from the compare-and-swap on state, from sending
 only stored bytes, and from attempts that exclude each other on the chain because they
-spend the same nonce or coins of the same sender (design call 5; Stop 4). On the worker
+spend the same nonce or coins of the same sender (Stop 4). On the worker
 path, clocks appear only in `claim`, `poll`, the backoff and the `stale` flag: they decide
 when work happens, never whether it is safe. One documented exception is test-only:
 `killOnce` assumes one worker per withdrawal, which the fault run respects.
@@ -516,8 +516,8 @@ If the slow step is the send, both send the same stored bytes: one transfer.
 
 **Why is the nonce in Postgres and not read from the node?** Two workers reading the
 pending nonce at once get the same value. `nextSequence` hands it out under a row lock in
-the transaction that commits `RESERVED`, and a rollback returns it (I3, I4). The cost
-(design call 6): a reserved nonce must be used, so there is no cancel after `RESERVED`;
+the transaction that commits `RESERVED`, and a rollback returns it (I3, I4). The cost:
+a reserved nonce must be used, so there is no cancel after `RESERVED`;
 and since the node is read only for the first seed (I5), a transaction sent from the hot
 address outside the pipeline would leave the counter behind.
 
@@ -559,11 +559,11 @@ chain; `track` clears `seen_block`, sends only the same stored bytes, and settle
 `finalityDepth` is outside what the pipeline handles.
 
 **Why does a revert end `FAILED` instead of retrying?** The nonce is consumed, and a
-blind retry of a revert is unsafe; an operator decides (design call 18, F4).
+blind retry of a revert is unsafe; an operator decides (F4).
 
 **Why SIGKILL and not an exception?** An exception runs `catch` blocks and `runOnce`'s
 error path; a real crash runs nothing. SIGKILL leaves the server to roll back what was
-open (design call 10, `killOnce`, X3b).
+open (`killOnce`, X3b).
 
 **What does reconciliation not prove?** It compares the ledger with the hot wallet, not
 with destinations; that is `verifyAgainstChain`. Its chain reads are not pinned to its

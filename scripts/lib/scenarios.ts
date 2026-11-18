@@ -1,4 +1,4 @@
-// The fault-injection scenarios (spec section 11): each scenario's function, then the description
+// The fault-injection scenarios: each scenario's function, then the description
 // docs/results.md prints for it. Every scenario runs on a fresh sandbox, makes its fault while
 // worker processes run the pipeline, and ends the same way (finish in scripts/lib/grading.ts):
 // extra blocks, an empty mempool, the destinations' balances on the chain, and reconciliation.

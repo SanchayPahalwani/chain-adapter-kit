@@ -167,8 +167,8 @@ person's hours.
 - `docker-compose.yml`: the `bitcoind` service, regtest only, published on `127.0.0.1:58443`,
   with a healthcheck.
 - `docker/bitcoind/Dockerfile`: the node image, built from the official Bitcoin Core release
-  tarball with its SHA-256 pinned per architecture, since the spec allows only official images
-  or official release tarballs (design call 17). Its fix dropped the `VOLUME` the image
+  tarball with its SHA-256 pinned per architecture, since the kit takes node software only from official images
+  or official release tarballs. Its fix dropped the `VOLUME` the image
   declared.
 - `Makefile`: `make up` passes `--build`, so Compose builds the local bitcoind image.
 - `package.json`, `package-lock.json`: the one new dependency, `@scure/btc-signer`, for
@@ -259,11 +259,11 @@ both chains. What needed something special:
 Solana was the first choice for a third chain, because a signed transaction carries a recent
 blockhash and expires with it, which would exercise the `null` branch of `buildReplacement`.
 It was ruled out because the kit's chains must run in Docker on linux/arm64 from official
-artifacts, and Solana's do not (checked 2026-11-12, spec section 7): Agave v4.4.1 and the 30
+artifacts, and Solana's do not (checked 2026-11-12): Agave v4.4.1 and the 30
 releases before it publish Linux tarballs for x86_64 only, the official image `anzaxyz/agave`
 is amd64 only, and run under emulation, `solana-test-validator` stops with
-`assertion failed: io_uring_supported()`. Community arm64 images exist; design call 17 rules
-them out.
+`assertion failed: io_uring_supported()`. Community arm64 images exist, but the kit takes node
+software only from official sources.
 
 Algorand's official `algorand/algod` image in dev mode was checked instead, and it runs
 natively on arm64. What an Algorand adapter would exercise:

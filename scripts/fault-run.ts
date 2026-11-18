@@ -1,6 +1,6 @@
 // Runs the fault-injection scenarios (scripts/lib/scenarios.ts) on each chain, one after another,
-// each on its own sandbox, and grades every withdrawal by what its destination holds on the chain
-// (spec section 11). One line per scenario and chain, then the table. docs/results.md is written
+// each on its own sandbox, and grades every withdrawal by what its destination holds on the chain.
+// One line per scenario and chain, then the table. docs/results.md is written
 // only by the full matrix at default counts (every chain; no --chain, --quick, --only or
 // --per-scenario), only when every scenario passed, and only if the checkout did not change during
 // the run. Exit code 1 if any failed or the file could not be written, 2 for a bad command line,
